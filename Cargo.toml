@@ -1,0 +1,10 @@
+[package]
+name = "skillset"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT OR Apache-2.0"
+authors = ["Nick Corin"]
+description = "Vendor agent skills from GitHub at pinned commits."
+repository = "https://github.com/nickcorin/skillset"
+readme = "README.md"
