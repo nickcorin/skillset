@@ -1,8 +1,6 @@
 # skillset
 
-skillset vendors agent skills from GitHub repositories at pinned commits into a folder you choose. A skill is a folder containing a `SKILL.md`. Pinned commits are recorded in a lock file compatible with the `skills-lock.json` format used by `npx skills`.
-
-The crate builds a single self-contained `skillset` binary.
+Vendor agent skills from GitHub at pinned commits into a folder you choose.
 
 ## Build
 
@@ -20,4 +18,6 @@ skillset version
 
 prints the version from `Cargo.toml` that the binary was built with.
 
-Licensed under MIT OR Apache-2.0.
+## License
+
+Licensed under [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE).

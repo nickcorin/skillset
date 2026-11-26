@@ -5,6 +5,6 @@ edition = "2024"
 rust-version = "1.100"
 license = "MIT OR Apache-2.0"
 authors = ["Nick Corin"]
-description = "Vendor agent skills from GitHub at pinned commits."
+description = "Vendor agent skills from GitHub at pinned commits into a folder you choose."
 repository = "https://github.com/nickcorin/skillset"
 readme = "README.md"
