@@ -18,63 +18,42 @@ fn skillset(args: &[&str]) -> Output {
 }
 
 #[test]
-fn version_long_flag_prints_version_and_exits_zero() {
-    let output = skillset(&["--version"]);
+fn version_flags_print_version_and_exit_zero() {
+    let expected = format!("skillset {}\n", env!("CARGO_PKG_VERSION"));
+    for flag in ["--version", "-V"] {
+        let output = skillset(&[flag]);
 
-    assert_eq!(output.status.code(), Some(0));
-    assert_eq!(
-        String::from_utf8(output.stdout).expect("stdout is valid UTF-8"),
-        format!("skillset {}\n", env!("CARGO_PKG_VERSION"))
-    );
-    assert_eq!(
-        String::from_utf8(output.stderr).expect("stderr is valid UTF-8"),
-        ""
-    );
+        assert_eq!(output.status.code(), Some(0), "flag: {flag}");
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("stdout is valid UTF-8"),
+            expected,
+            "flag: {flag}"
+        );
+        assert_eq!(
+            String::from_utf8(output.stderr).expect("stderr is valid UTF-8"),
+            "",
+            "flag: {flag}"
+        );
+    }
 }
 
 #[test]
-fn version_short_flag_prints_version_and_exits_zero() {
-    let output = skillset(&["-V"]);
+fn help_flags_print_help_and_exit_zero() {
+    for flag in ["--help", "-h"] {
+        let output = skillset(&[flag]);
 
-    assert_eq!(output.status.code(), Some(0));
-    assert_eq!(
-        String::from_utf8(output.stdout).expect("stdout is valid UTF-8"),
-        format!("skillset {}\n", env!("CARGO_PKG_VERSION"))
-    );
-    assert_eq!(
-        String::from_utf8(output.stderr).expect("stderr is valid UTF-8"),
-        ""
-    );
-}
-
-#[test]
-fn help_long_flag_prints_help_and_exits_zero() {
-    let output = skillset(&["--help"]);
-
-    assert_eq!(output.status.code(), Some(0));
-    assert_eq!(
-        String::from_utf8(output.stdout).expect("stdout is valid UTF-8"),
-        HELP_OUTPUT
-    );
-    assert_eq!(
-        String::from_utf8(output.stderr).expect("stderr is valid UTF-8"),
-        ""
-    );
-}
-
-#[test]
-fn help_short_flag_prints_help_and_exits_zero() {
-    let output = skillset(&["-h"]);
-
-    assert_eq!(output.status.code(), Some(0));
-    assert_eq!(
-        String::from_utf8(output.stdout).expect("stdout is valid UTF-8"),
-        HELP_OUTPUT
-    );
-    assert_eq!(
-        String::from_utf8(output.stderr).expect("stderr is valid UTF-8"),
-        ""
-    );
+        assert_eq!(output.status.code(), Some(0), "flag: {flag}");
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("stdout is valid UTF-8"),
+            HELP_OUTPUT,
+            "flag: {flag}"
+        );
+        assert_eq!(
+            String::from_utf8(output.stderr).expect("stderr is valid UTF-8"),
+            "",
+            "flag: {flag}"
+        );
+    }
 }
 
 #[test]

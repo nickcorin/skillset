@@ -49,8 +49,8 @@ mod tests {
     }
 
     #[test]
-    fn write_failure_exits_one_for_version_and_help() {
-        for flag in ["--version", "--help"] {
+    fn stdout_write_failure_exits_one_for_version_and_help() {
+        for flag in ["--version", "-V", "--help", "-h"] {
             let Err(err) = Cli::try_parse_from(["skillset", flag]) else {
                 panic!("expected clap exit for {flag}");
             };
@@ -58,8 +58,20 @@ mod tests {
             let code = write_clap_error(&err, &mut FailingWriter, &mut stderr);
 
             assert_eq!(code, 1, "expected exit 1 for {flag}");
-            assert!(stderr.is_empty());
+            assert!(stderr.is_empty(), "expected empty stderr for {flag}");
         }
+    }
+
+    #[test]
+    fn stderr_write_failure_exits_one_for_usage_error() {
+        let Err(err) = Cli::try_parse_from(["skillset", "--bogus"]) else {
+            panic!("expected clap parse error");
+        };
+        let mut stdout = Vec::new();
+        let code = write_clap_error(&err, &mut stdout, &mut FailingWriter);
+
+        assert_eq!(code, 1);
+        assert!(stdout.is_empty());
     }
 
     #[test]
