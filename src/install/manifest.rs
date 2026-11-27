@@ -6,8 +6,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use serde::Deserialize;
-use serde_json::json;
+use serde::{Deserialize, Serialize};
 
 use super::InstallError;
 use crate::lock::FolderName;
@@ -19,7 +18,7 @@ pub(super) struct Manifest {
     pub(super) skills: BTreeSet<FolderName>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ManifestJson {
     version: u64,
@@ -59,12 +58,17 @@ impl Manifest {
     }
 
     pub(super) fn to_json(&self) -> Vec<u8> {
-        let skills: Vec<&str> = self.skills.iter().map(FolderName::as_str).collect();
-        format!(
-            "{:#}\n",
-            json!({ "version": Self::VERSION, "skills": skills })
-        )
-        .into_bytes()
+        let json = ManifestJson {
+            version: Self::VERSION,
+            skills: self
+                .skills
+                .iter()
+                .map(|name| name.as_str().to_owned())
+                .collect(),
+        };
+        let mut bytes = serde_json::to_vec_pretty(&json).expect("a manifest always serializes");
+        bytes.push(b'\n');
+        bytes
     }
 }
 
