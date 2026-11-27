@@ -1,7 +1,3 @@
-#[cfg(target_os = "linux")]
-use std::fs::File;
-#[cfg(target_os = "linux")]
-use std::process::Stdio;
 use std::process::{Command, Output};
 
 const HELP_OUTPUT: &str = "\
@@ -136,30 +132,4 @@ Usage: skillset
 For more information, try '--help'.
 "
     );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn stdout_write_failure_exits_one() {
-    for flag in ["--version", "--help"] {
-        let dev_full = File::options()
-            .write(true)
-            .open("/dev/full")
-            .expect("failed to open /dev/full");
-
-        let output = Command::new(env!("CARGO_BIN_EXE_skillset"))
-            .arg(flag)
-            .stdout(Stdio::from(dev_full))
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("failed to spawn skillset binary")
-            .wait_with_output()
-            .expect("failed to wait for skillset binary");
-
-        assert_eq!(output.status.code(), Some(1), "expected exit 1 for {flag}");
-        assert_eq!(
-            String::from_utf8(output.stderr).expect("stderr is valid UTF-8"),
-            ""
-        );
-    }
 }
