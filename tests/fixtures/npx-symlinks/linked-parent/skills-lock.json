@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "skills": {
+    "widget": {
+      "source": "../parent-src/via/widget",
+      "sourceType": "local",
+      "computedHash": "04e7b68031aa35831a4645b988cb0357f0821d19f1128dd40b30f4ba7fb52c86",
+      "installMode": "copy"
+    }
+  }
+}

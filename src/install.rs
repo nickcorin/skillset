@@ -1,7 +1,8 @@
 //! The install folder.
 //!
 //! `<skill>/` holds that skill's files. Everything else in the install folder is
-//! left alone. Replacing a skill folder unlinks a symlink instead of following it.
+//! left alone. A symlink on the way to that folder is followed. Replacing a skill
+//! folder unlinks a symlink instead of following it.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -23,8 +24,9 @@ const DEFAULT_INSTALL_DIR: &str = ".agents/skills";
 /// The folder a lock is restored into. It is always strictly inside the lock file's
 /// folder.
 pub struct InstallFolder {
-    /// The lock file's folder, as given. Ancestors of this are left alone.
-    base: PathBuf,
+    /// The lock file's folder, as given. `None` when the lock file is in the
+    /// current directory. Ancestors of this are left alone.
+    base: Option<PathBuf>,
     /// Path of the install folder relative to `base`.
     relative: PathBuf,
 }
@@ -42,6 +44,136 @@ enum Kind {
     Dir,
     Symlink,
     Other,
+}
+
+/// A filesystem path the install reads or writes.
+struct EntryPath<'a>(&'a Path);
+
+#[derive(Clone, Copy, Debug)]
+pub enum IoAction {
+    Resolve,
+    Create,
+    Read,
+    Remove,
+    Write,
+}
+
+impl IoAction {
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Resolve => "resolve",
+            Self::Create => "create",
+            Self::Read => "read",
+            Self::Remove => "remove",
+            Self::Write => "write",
+        }
+    }
+}
+
+impl EntryPath<'_> {
+    fn kind(&self) -> io::Result<Kind> {
+        match fs::symlink_metadata(self.0) {
+            Ok(metadata) if metadata.file_type().is_symlink() => Ok(Kind::Symlink),
+            Ok(metadata) if metadata.is_dir() => Ok(Kind::Dir),
+            Ok(_) => Ok(Kind::Other),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Kind::Missing),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// A symlink is left in place so later writes follow it.
+    fn make_dir(&self) -> io::Result<()> {
+        match self.kind()? {
+            Kind::Dir | Kind::Symlink => Ok(()),
+            Kind::Missing => fs::create_dir(self.0),
+            Kind::Other => {
+                self.remove_leaf()?;
+                fs::create_dir(self.0)
+            }
+        }
+    }
+
+    fn is_executable(&self) -> io::Result<bool> {
+        #[cfg(unix)]
+        {
+            Ok(fs::metadata(self.0)?.permissions().mode() & 0o111 != 0)
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(false)
+        }
+    }
+
+    fn mark_executable(&self, executable: bool) -> io::Result<()> {
+        #[cfg(unix)]
+        if executable {
+            let mut permissions = fs::metadata(self.0)?.permissions();
+            let mode = permissions.mode();
+            permissions.set_mode(mode | ((mode & 0o444) >> 2));
+            fs::set_permissions(self.0, permissions)?;
+        }
+        #[cfg(not(unix))]
+        let _ = executable;
+        Ok(())
+    }
+
+    fn remove_leaf(&self) -> io::Result<()> {
+        fs::remove_file(self.0).or_else(|_| fs::remove_dir(self.0))
+    }
+
+    fn remove_tree(&self) -> io::Result<()> {
+        match self.kind()? {
+            Kind::Symlink | Kind::Other => return self.remove_leaf(),
+            Kind::Missing => return Ok(()),
+            Kind::Dir => {}
+        }
+        for entry in fs::read_dir(self.0)?.collect::<io::Result<Vec<_>>>()? {
+            EntryPath(&entry.path()).remove_tree()?;
+        }
+        fs::remove_dir(self.0)
+    }
+
+    /// `Ok(false)` when the tree is not only files: a symlink, an empty directory,
+    /// a non-UTF-8 name, or some other file type. `prefix` is `None` at the skill root.
+    fn collect_files(
+        &self,
+        prefix: Option<&str>,
+        found: &mut BTreeMap<String, SkillFile>,
+    ) -> io::Result<bool> {
+        let entries = fs::read_dir(self.0)?.collect::<io::Result<Vec<_>>>()?;
+        if entries.is_empty() && prefix.is_some() {
+            return Ok(false);
+        }
+        for entry in entries {
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                return Ok(false);
+            }
+            let Ok(name) = entry.file_name().into_string() else {
+                return Ok(false);
+            };
+            let relative = match prefix {
+                Some(prefix) => format!("{prefix}/{name}"),
+                None => name,
+            };
+            if file_type.is_dir() {
+                if !EntryPath(&entry.path()).collect_files(Some(&relative), found)? {
+                    return Ok(false);
+                }
+            } else if file_type.is_file() {
+                found.insert(
+                    relative,
+                    SkillFile {
+                        contents: fs::read(entry.path())?,
+                        executable: EntryPath(&entry.path()).is_executable()?,
+                    },
+                );
+            } else {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -78,12 +210,62 @@ impl LexicalPath {
         Ok(Self::normalize(&env::current_dir()?))
     }
 
+    fn from_lock_base(base: Option<&Path>) -> Result<Self, InstallError> {
+        match base {
+            None => Self::current_dir()
+                .map_err(|source| InstallError::io(IoAction::Resolve, Path::new("."), source)),
+            Some(base) if base.is_absolute() => Ok(Self::normalize(base)),
+            Some(base) => Ok(Self::current_dir()
+                .map_err(|source| InstallError::io(IoAction::Resolve, base, source))?
+                .joined(base)),
+        }
+    }
+
     fn joined(&self, path: &Path) -> Self {
         Self::normalize(&self.0.join(path))
     }
 
     fn relative_to(&self, child: &Self) -> Option<PathBuf> {
         child.0.strip_prefix(&self.0).ok().map(PathBuf::from)
+    }
+
+    /// `--dir`, resolved against the current directory, then required to land inside
+    /// this lock folder. Absolute paths are accepted.
+    fn flag_dir(&self, path: &Path) -> Result<PathBuf, InstallError> {
+        let resolved = if path.is_absolute() {
+            Self::normalize(path)
+        } else {
+            Self::current_dir()
+                .map_err(|source| InstallError::io(IoAction::Resolve, path, source))?
+                .joined(path)
+        };
+        self.inside(&resolved, DirOrigin::Flag, path)
+    }
+
+    /// `skillset.installDir` or the default, relative to this lock folder.
+    fn lock_dir(&self, path: &Path) -> Result<PathBuf, InstallError> {
+        if path.is_absolute() {
+            return Err(InstallError::Directory(DirectoryError::Absolute {
+                origin: DirOrigin::Lock,
+                path: path.to_path_buf(),
+            }));
+        }
+        self.inside(&self.joined(path), DirOrigin::Lock, path)
+    }
+
+    fn inside(
+        &self,
+        resolved: &Self,
+        origin: DirOrigin,
+        given: &Path,
+    ) -> Result<PathBuf, InstallError> {
+        match self.relative_to(resolved) {
+            Some(relative) if !relative.as_os_str().is_empty() => Ok(relative),
+            _ => Err(InstallError::Directory(DirectoryError::Outside {
+                origin,
+                path: given.to_path_buf(),
+            })),
+        }
     }
 }
 
@@ -110,83 +292,32 @@ impl InstallFolder {
         flag: Option<&Path>,
         from_lock: Option<&Path>,
     ) -> Result<Self, InstallError> {
-        let base = lock_path.parent().unwrap_or(Path::new("")).to_path_buf();
-        let lock_folder = Self::lock_folder(&base)?;
+        let base = lock_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(PathBuf::from);
+        let lock_folder = LexicalPath::from_lock_base(base.as_deref())?;
         let relative = if let Some(path) = flag {
-            Self::flag_dir(path, &lock_folder)?
+            lock_folder.flag_dir(path)?
         } else if let Some(path) = from_lock {
-            Self::lock_dir(path, &lock_folder)?
+            lock_folder.lock_dir(path)?
         } else {
-            Self::lock_dir(Path::new(DEFAULT_INSTALL_DIR), &lock_folder)?
+            lock_folder.lock_dir(Path::new(DEFAULT_INSTALL_DIR))?
         };
         Ok(Self { base, relative })
     }
 
-    fn lock_folder(base: &Path) -> Result<LexicalPath, InstallError> {
-        if base.as_os_str().is_empty() {
-            return LexicalPath::current_dir()
-                .map_err(|source| InstallError::io("resolve", Path::new("."), source));
-        }
-        if base.is_absolute() {
-            return Ok(LexicalPath::normalize(base));
-        }
-        Ok(LexicalPath::current_dir()
-            .map_err(|source| InstallError::io("resolve", base, source))?
-            .joined(base))
-    }
-
-    /// `--dir`, resolved against the current directory, then required to land inside
-    /// the lock folder. Absolute paths are accepted.
-    fn flag_dir(path: &Path, lock_folder: &LexicalPath) -> Result<PathBuf, InstallError> {
-        let resolved = if path.is_absolute() {
-            LexicalPath::normalize(path)
-        } else {
-            LexicalPath::current_dir()
-                .map_err(|source| InstallError::io("resolve", path, source))?
-                .joined(path)
-        };
-        Self::inside(lock_folder, &resolved, DirOrigin::Flag, path)
-    }
-
-    /// `skillset.installDir` or the default, relative to the lock folder.
-    fn lock_dir(path: &Path, lock_folder: &LexicalPath) -> Result<PathBuf, InstallError> {
-        if path.is_absolute() {
-            return Err(InstallError::Directory(DirectoryError::Absolute {
-                origin: DirOrigin::Lock,
-                path: path.to_path_buf(),
-            }));
-        }
-        Self::inside(
-            lock_folder,
-            &lock_folder.joined(path),
-            DirOrigin::Lock,
-            path,
-        )
-    }
-
-    fn inside(
-        lock_folder: &LexicalPath,
-        resolved: &LexicalPath,
-        origin: DirOrigin,
-        given: &Path,
-    ) -> Result<PathBuf, InstallError> {
-        match lock_folder.relative_to(resolved) {
-            Some(relative) if !relative.as_os_str().is_empty() => Ok(relative),
-            _ => Err(InstallError::Directory(DirectoryError::Outside {
-                origin,
-                path: given.to_path_buf(),
-            })),
-        }
-    }
-
     fn full(&self) -> PathBuf {
-        self.base.join(&self.relative)
+        match &self.base {
+            Some(base) => base.join(&self.relative),
+            None => self.relative.clone(),
+        }
     }
 
     fn apply(&self, skills: &[LockedSkill]) -> Result<(), InstallError> {
         if !skills.is_empty() {
             self.create_root()
-                .map_err(|source| InstallError::io("create", &self.full(), source))?;
+                .map_err(|source| InstallError::io(IoAction::Create, &self.full(), source))?;
             for skill in skills {
                 self.place(
                     &self.full().join(skill.folder.as_str()),
@@ -197,16 +328,16 @@ impl InstallFolder {
         Ok(())
     }
 
-    /// Creates the install folder. A symlink in the relative path is replaced.
+    /// Creates the install folder. A symlink on the way is followed.
     /// `base` is only created, never replaced.
     fn create_root(&self) -> io::Result<()> {
-        if !self.base.as_os_str().is_empty() {
-            fs::create_dir_all(&self.base)?;
+        if let Some(base) = &self.base {
+            fs::create_dir_all(base)?;
         }
-        let mut prefix = self.base.clone();
+        let mut prefix = self.base.clone().unwrap_or_default();
         for component in self.relative.components() {
             prefix.push(component);
-            Self::make_dir(&prefix)?;
+            EntryPath(&prefix).make_dir()?;
         }
         Ok(())
     }
@@ -214,18 +345,18 @@ impl InstallFolder {
     fn place(&self, path: &Path, files: &BTreeMap<String, SkillFile>) -> Result<(), InstallError> {
         if self
             .matches_files(path, files)
-            .map_err(|source| InstallError::io("read", path, source))?
+            .map_err(|source| InstallError::io(IoAction::Read, path, source))?
         {
             return Ok(());
         }
         self.remove_at(path)
-            .map_err(|source| InstallError::io("remove", path, source))?;
+            .map_err(|source| InstallError::io(IoAction::Remove, path, source))?;
         self.write(path, files)
-            .map_err(|source| InstallError::io("write", path, source))
+            .map_err(|source| InstallError::io(IoAction::Write, path, source))
     }
 
     /// True when `path` is a real directory holding exactly `files`, byte for byte,
-    /// including the executable bit. A symlink on the way is not followed.
+    /// including the executable bit. A symlink on the skill path is not followed.
     fn matches_files(&self, path: &Path, files: &BTreeMap<String, SkillFile>) -> io::Result<bool> {
         let root = self.full();
         let Ok(relative) = path.strip_prefix(&root) else {
@@ -234,62 +365,26 @@ impl InstallFolder {
         let mut cursor = root;
         for component in relative.components() {
             cursor.push(component);
-            if !matches!(Self::kind(&cursor)?, Kind::Dir) {
+            if !matches!(EntryPath(&cursor).kind()?, Kind::Dir) {
                 return Ok(false);
             }
         }
         let mut found = BTreeMap::new();
-        if !Self::collect_files(path, "", &mut found)? {
+        if !EntryPath(path).collect_files(None, &mut found)? {
             return Ok(false);
         }
         if found.len() != files.len() {
             return Ok(false);
         }
         for (relative, file) in files {
-            let Some((contents, executable)) = found.get(relative) else {
+            let Some(found_file) = found.get(relative) else {
                 return Ok(false);
             };
-            if contents != &file.contents {
+            if found_file.contents != file.contents {
                 return Ok(false);
             }
             #[cfg(unix)]
-            if *executable != file.executable {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    /// `Ok(false)` when the tree is not only files: a symlink, an empty directory,
-    /// a non-UTF-8 name, or some other file type.
-    fn collect_files(
-        directory: &Path,
-        prefix: &str,
-        found: &mut BTreeMap<String, (Vec<u8>, bool)>,
-    ) -> io::Result<bool> {
-        let entries = fs::read_dir(directory)?.collect::<io::Result<Vec<_>>>()?;
-        if entries.is_empty() && !prefix.is_empty() {
-            return Ok(false);
-        }
-        for entry in entries {
-            let file_type = entry.file_type()?;
-            if file_type.is_symlink() {
-                return Ok(false);
-            }
-            let Ok(name) = entry.file_name().into_string() else {
-                return Ok(false);
-            };
-            let relative = format!("{prefix}{name}");
-            if file_type.is_dir() {
-                if !Self::collect_files(&entry.path(), &format!("{relative}/"), found)? {
-                    return Ok(false);
-                }
-            } else if file_type.is_file() {
-                found.insert(
-                    relative,
-                    (fs::read(entry.path())?, Self::is_executable(&entry.path())?),
-                );
-            } else {
+            if found_file.executable != file.executable {
                 return Ok(false);
             }
         }
@@ -306,11 +401,11 @@ impl InstallFolder {
         for (index, component) in components.iter().enumerate() {
             prefix.push(component);
             let last = index + 1 == components.len();
-            match Self::kind(&prefix)? {
+            match EntryPath(&prefix).kind()? {
                 Kind::Missing => return Ok(()),
                 Kind::Dir if !last => {}
-                Kind::Dir => return Self::remove_tree(&prefix),
-                Kind::Symlink | Kind::Other => return Self::remove_leaf(&prefix),
+                Kind::Dir => return EntryPath(&prefix).remove_tree(),
+                Kind::Symlink | Kind::Other => return EntryPath(&prefix).remove_leaf(),
             }
         }
         Ok(())
@@ -327,7 +422,7 @@ impl InstallFolder {
                 self.ensure(parent)?;
             }
             fs::write(&target, &file.contents)?;
-            Self::mark_executable(&target, file.executable)?;
+            EntryPath(&target).mark_executable(file.executable)?;
         }
         Ok(())
     }
@@ -337,75 +432,13 @@ impl InstallFolder {
         let relative = path.strip_prefix(&root).map_err(|_| {
             io::Error::other(format!("{} is outside the install folder", path.display()))
         })?;
-        Self::make_dir(&root)?;
+        EntryPath(&root).make_dir()?;
         let mut prefix = root;
         for component in relative.components() {
             prefix.push(component);
-            Self::make_dir(&prefix)?;
+            EntryPath(&prefix).make_dir()?;
         }
         Ok(())
-    }
-
-    fn kind(path: &Path) -> io::Result<Kind> {
-        match fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => Ok(Kind::Symlink),
-            Ok(metadata) if metadata.is_dir() => Ok(Kind::Dir),
-            Ok(_) => Ok(Kind::Other),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Kind::Missing),
-            Err(err) => Err(err),
-        }
-    }
-
-    fn make_dir(path: &Path) -> io::Result<()> {
-        match Self::kind(path)? {
-            Kind::Dir => Ok(()),
-            Kind::Missing => fs::create_dir(path),
-            Kind::Symlink | Kind::Other => {
-                Self::remove_leaf(path)?;
-                fs::create_dir(path)
-            }
-        }
-    }
-
-    fn is_executable(path: &Path) -> io::Result<bool> {
-        #[cfg(unix)]
-        {
-            Ok(fs::metadata(path)?.permissions().mode() & 0o111 != 0)
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = path;
-            Ok(false)
-        }
-    }
-
-    fn mark_executable(path: &Path, executable: bool) -> io::Result<()> {
-        #[cfg(unix)]
-        if executable {
-            let mut permissions = fs::metadata(path)?.permissions();
-            let mode = permissions.mode();
-            permissions.set_mode(mode | ((mode & 0o444) >> 2));
-            fs::set_permissions(path, permissions)?;
-        }
-        #[cfg(not(unix))]
-        let _ = (path, executable);
-        Ok(())
-    }
-
-    fn remove_leaf(path: &Path) -> io::Result<()> {
-        fs::remove_file(path).or_else(|_| fs::remove_dir(path))
-    }
-
-    fn remove_tree(path: &Path) -> io::Result<()> {
-        match Self::kind(path)? {
-            Kind::Symlink | Kind::Other => return Self::remove_leaf(path),
-            Kind::Missing => return Ok(()),
-            Kind::Dir => {}
-        }
-        for entry in fs::read_dir(path)?.collect::<io::Result<Vec<_>>>()? {
-            Self::remove_tree(&entry.path())?;
-        }
-        fs::remove_dir(path)
     }
 }
 
@@ -467,7 +500,7 @@ pub enum InstallError {
         source: Box<SkillError>,
     },
     Io {
-        action: &'static str,
+        action: IoAction,
         path: PathBuf,
         source: io::Error,
     },
@@ -482,7 +515,7 @@ pub enum DirectoryError {
 }
 
 impl InstallError {
-    fn io(action: &'static str, path: &Path, source: io::Error) -> Self {
+    fn io(action: IoAction, path: &Path, source: io::Error) -> Self {
         Self::Io {
             action,
             path: path.to_path_buf(),
@@ -543,7 +576,7 @@ impl fmt::Display for InstallError {
                 action,
                 path,
                 source,
-            } => write!(f, "cannot {action} {}: {source}", path.display()),
+            } => write!(f, "cannot {} {}: {source}", action.verb(), path.display()),
         }
     }
 }

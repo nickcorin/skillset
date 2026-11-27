@@ -81,9 +81,9 @@ impl SkillPath {
         }
     }
 
-    /// Folder of the skill inside the repository. Empty when `SKILL.md` is at the root.
-    pub(crate) fn folder(&self) -> &str {
-        self.0.rsplit_once('/').map_or("", |(folder, _)| folder)
+    /// Folder of the skill inside the repository. `None` when `SKILL.md` is at the root.
+    pub(crate) fn folder(&self) -> Option<&str> {
+        self.0.rsplit_once('/').map(|(folder, _)| folder)
     }
 
     pub(crate) fn file_name(&self) -> &str {

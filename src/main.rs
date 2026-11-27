@@ -20,7 +20,7 @@ fn main() -> ExitCode {
     };
     let result = match cli.command {
         Command::Install(args) => {
-            InstallFolder::install(&args.lock, args.dir.as_deref(), &GitHub::new())
+            InstallFolder::install(&args.lock, args.dir.as_deref(), &GitHub::codeload())
         }
     };
     match result {

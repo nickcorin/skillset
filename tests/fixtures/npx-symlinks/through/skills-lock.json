@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "skills": {
+    "through": {
+      "source": "../through-src/through",
+      "sourceType": "local",
+      "computedHash": "6fb04f6bfc95d202ae1d06a823302ae1d6cc610d89c597449d4558a6d27f4086",
+      "installMode": "copy"
+    }
+  }
+}

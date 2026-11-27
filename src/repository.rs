@@ -11,10 +11,17 @@ use flate2::read::GzDecoder;
 use crate::content_hash::ContentHash;
 use crate::skill::{Skill, SkillFile, SkillPath};
 
+/// `fs.realpath` gives up after this many symlink hops. One more is `ELOOP`.
+const SYMLINK_HOP_LIMIT: u32 = 40;
 const EXCLUDED_FOLDERS: [&str; 3] = [".git", "__pycache__", "__pypackages__"];
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct RepoPath(String);
+
+enum Relation<'a> {
+    Same,
+    Inside(&'a str),
+}
 
 impl RepoPath {
     fn parse(path: &str) -> Result<Self, RepoPathError> {
@@ -35,8 +42,78 @@ impl RepoPath {
         }
     }
 
+    fn from_component(component: &str) -> Option<Self> {
+        Self::parse(component).ok()
+    }
+
     fn as_str(&self) -> &str {
         &self.0
+    }
+
+    fn components(&self) -> impl Iterator<Item = &str> {
+        self.0.split('/')
+    }
+
+    fn parent(&self) -> Option<Self> {
+        self.0
+            .rsplit_once('/')
+            .map(|(parent, _)| Self(parent.to_owned()))
+    }
+
+    fn join(&self, component: &str) -> Option<Self> {
+        let child = Self::from_component(component)?;
+        Some(Self(format!("{}/{}", self.0, child.as_str())))
+    }
+
+    fn relative_to<'a>(&'a self, root: &Self) -> Option<Relation<'a>> {
+        if self == root {
+            Some(Relation::Same)
+        } else {
+            self.0
+                .strip_prefix(root.as_str())
+                .and_then(|rest| rest.strip_prefix('/'))
+                .map(Relation::Inside)
+        }
+    }
+
+    fn within(&self, root: &Self) -> bool {
+        match self.relative_to(root) {
+            Some(Relation::Same) => true,
+            Some(Relation::Inside(rest)) => !rest.is_empty(),
+            None => false,
+        }
+    }
+}
+
+/// A location in the repository. The root has no path of its own.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Place {
+    Root,
+    Path(RepoPath),
+}
+
+impl Place {
+    fn path(&self) -> Option<&RepoPath> {
+        match self {
+            Self::Root => None,
+            Self::Path(path) => Some(path),
+        }
+    }
+
+    fn join(&self, component: &str) -> Option<Self> {
+        let path = match self {
+            Self::Root => RepoPath::from_component(component)?,
+            Self::Path(path) => path.join(component)?,
+        };
+        Some(Self::Path(path))
+    }
+
+    fn contains(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Root, _) => true,
+            (Self::Path(root), Self::Path(path)) => path.within(root),
+            (Self::Path(_), Self::Root) => false,
+        }
     }
 }
 
@@ -80,7 +157,7 @@ impl Repository {
         self.insert(path, Node::File(file))
     }
 
-    fn add_symlink(&mut self, path: &str, target: &str) -> Result<(), ArchiveError> {
+    pub fn add_symlink(&mut self, path: &str, target: &str) -> Result<(), ArchiveError> {
         self.insert(path, Node::Symlink(target.to_owned()))
     }
 
@@ -90,7 +167,8 @@ impl Repository {
     }
 
     /// Reads a gzipped tarball whose entries sit under one top-level folder, which
-    /// is how GitHub lays out a commit. Symlinks are recorded and not resolved.
+    /// is how GitHub lays out a commit. Symlink targets are stored and resolved
+    /// when a skill is read.
     pub fn from_tar_gz(reader: impl Read) -> Result<Self, ArchiveError> {
         let mut archive = tar::Archive::new(GzDecoder::new(reader));
         let mut repository = Self::new();
@@ -158,22 +236,33 @@ impl Repository {
     /// The skill whose `SKILL.md` is at `skill_path`.
     ///
     /// `metadata.json`, `.git`, `__pycache__`, and `__pypackages__` are left out, as
-    /// they are in the lock's `computedHash`. A symlink is replaced by the file it
-    /// names when that file stays inside the skill folder. A link that is broken,
-    /// loops, or leaves the folder is left out. An absolute link is an error.
+    /// they are in the lock's `computedHash`. Each path is resolved one component at
+    /// a time, the way `realpath` does. A symlink becomes the file or folder it names
+    /// when that target stays inside the skill folder. A link that is broken, loops,
+    /// leaves the folder, or is absolute is left out.
     pub(crate) fn skill(
         &self,
         skill_path: &SkillPath,
         expected: &ContentHash,
     ) -> Result<Skill, SkillError> {
-        let folder = skill_path.folder();
-        if matches!(self.node(folder), Some(Node::Symlink(_))) {
-            return Err(SkillError::FolderSymlink {
-                path: folder.to_owned(),
+        let folder = match skill_path.folder() {
+            Some(path) => Some(RepoPath::parse(path).map_err(|_| SkillError::Missing {
+                path: skill_path.clone(),
+            })?),
+            None => None,
+        };
+        let Some(root) = self.canonicalize(folder.as_ref()) else {
+            return Err(SkillError::Missing {
+                path: skill_path.clone(),
+            });
+        };
+        if !self.is_directory(&root) {
+            return Err(SkillError::Missing {
+                path: skill_path.clone(),
             });
         }
         let mut files = BTreeMap::new();
-        self.collect(folder, folder, "", &BTreeSet::new(), &mut files)?;
+        self.collect(&root, &root, None, &BTreeSet::new(), &mut files);
         if !files.contains_key(skill_path.file_name()) {
             return Err(SkillError::Missing {
                 path: skill_path.clone(),
@@ -185,23 +274,98 @@ impl Repository {
         })
     }
 
-    fn node(&self, path: &str) -> Option<&Node> {
-        self.nodes.get(&RepoPath::parse(path).ok()?)
+    fn canonicalize(&self, path: Option<&RepoPath>) -> Option<Place> {
+        let parts = path
+            .map(|path| path.components().map(str::to_owned).collect())
+            .unwrap_or_default();
+        self.walk(None, parts, &mut 0)
     }
 
-    fn children(&self, dir: &str) -> BTreeSet<String> {
+    /// `cursor` is the directory already resolved. `None` is the repository root.
+    fn walk(
+        &self,
+        mut cursor: Option<RepoPath>,
+        mut parts: Vec<String>,
+        hops: &mut u32,
+    ) -> Option<Place> {
+        let mut index = 0;
+        while index < parts.len() {
+            let component = parts[index].clone();
+            index += 1;
+            match component.as_str() {
+                "" | "." => {}
+                ".." => {
+                    let path = cursor?;
+                    cursor = path.parent();
+                }
+                name => {
+                    let next = match &cursor {
+                        Some(dir) => dir.join(name)?,
+                        None => RepoPath::from_component(name)?,
+                    };
+                    match self.nodes.get(&next) {
+                        Some(Node::Symlink(target)) => {
+                            *hops += 1;
+                            if *hops > SYMLINK_HOP_LIMIT {
+                                return None;
+                            }
+                            if Path::new(target).is_absolute() {
+                                return None;
+                            }
+                            let mut restarted: Vec<String> =
+                                target.split('/').map(str::to_owned).collect();
+                            restarted.extend(parts.iter().skip(index).cloned());
+                            parts = restarted;
+                            index = 0;
+                        }
+                        Some(Node::File(_)) => {
+                            if index != parts.len() {
+                                return None;
+                            }
+                            return Some(Place::Path(next));
+                        }
+                        None => {
+                            if !self.is_dir(&next) {
+                                return None;
+                            }
+                            cursor = Some(next);
+                        }
+                    }
+                }
+            }
+        }
+        Some(match cursor {
+            Some(path) => Place::Path(path),
+            None => Place::Root,
+        })
+    }
+
+    fn is_directory(&self, place: &Place) -> bool {
+        match place {
+            Place::Root => true,
+            Place::Path(path) => self.is_dir(path),
+        }
+    }
+
+    fn is_dir(&self, path: &RepoPath) -> bool {
+        let prefix = format!("{}/", path.as_str());
+        self.nodes
+            .keys()
+            .any(|key| key.as_str().starts_with(&prefix))
+    }
+
+    fn child_names(&self, place: &Place) -> BTreeSet<String> {
+        let prefix = place.path().map(|path| format!("{}/", path.as_str()));
         let mut names = BTreeSet::new();
         for path in self.nodes.keys() {
-            let rest = if dir.is_empty() {
-                path.as_str()
-            } else {
-                let Some(rest) = path.as_str().strip_prefix(dir) else {
-                    continue;
-                };
-                let Some(rest) = rest.strip_prefix('/') else {
-                    continue;
-                };
-                rest
+            let rest = match &prefix {
+                None => path.as_str(),
+                Some(prefix) => {
+                    let Some(rest) = path.as_str().strip_prefix(prefix.as_str()) else {
+                        continue;
+                    };
+                    rest
+                }
             };
             if let Some(name) = rest.split('/').next()
                 && !name.is_empty()
@@ -214,144 +378,68 @@ impl Repository {
 
     fn collect(
         &self,
-        skill_root: &str,
-        dir: &str,
-        prefix: &str,
-        ancestors: &BTreeSet<String>,
+        logical: &Place,
+        root: &Place,
+        prefix: Option<&str>,
+        ancestors: &BTreeSet<Place>,
         files: &mut BTreeMap<String, SkillFile>,
-    ) -> Result<(), SkillError> {
-        if ancestors.contains(dir) {
-            return Ok(());
+    ) {
+        let Some(real) = self.canonicalize(logical.path()) else {
+            return;
+        };
+        if !self.is_directory(&real) || ancestors.contains(&real) {
+            return;
         }
-        let mut ancestors = ancestors.clone();
-        ancestors.insert(dir.to_owned());
-        for name in self.children(dir) {
-            let path = if dir.is_empty() {
-                name.clone()
-            } else {
-                format!("{dir}/{name}")
+        let mut branch = ancestors.clone();
+        branch.insert(real.clone());
+        for name in self.child_names(&real) {
+            let Some(Place::Path(at)) = real.join(&name) else {
+                continue;
             };
-            let out = format!("{prefix}{name}");
-            match self.node(&path) {
+            let Some(logical_child) = logical.join(&name) else {
+                continue;
+            };
+            let key = match prefix {
+                Some(prefix) => format!("{prefix}/{name}"),
+                None => name.clone(),
+            };
+            match self.nodes.get(&at) {
                 Some(Node::File(file)) => {
-                    if !Self::leave_out(&name, false) {
-                        files.insert(out, file.clone());
+                    if name != "metadata.json" {
+                        files.insert(key, file.clone());
                     }
                 }
                 Some(Node::Symlink(_)) => {
-                    if Self::leave_out(&name, false) {
+                    if name == "metadata.json" {
                         continue;
                     }
-                    match self.follow(skill_root, &path, &mut BTreeSet::new())? {
-                        Followed::Skip => {}
-                        Followed::File(file) => {
-                            files.insert(out, file);
+                    let Some(resolved) = self.canonicalize(logical_child.path()) else {
+                        continue;
+                    };
+                    if !root.contains(&resolved) {
+                        continue;
+                    }
+                    if self.is_directory(&resolved) {
+                        if EXCLUDED_FOLDERS.contains(&name.as_str()) {
+                            continue;
                         }
-                        Followed::Dir(target) if !Self::leave_out(&name, true) => {
-                            self.collect(
-                                skill_root,
-                                &target,
-                                &format!("{out}/"),
-                                &ancestors,
-                                files,
-                            )?;
-                        }
-                        Followed::Dir(_) => {}
+                        self.collect(&logical_child, root, Some(&key), &branch, files);
+                    } else if let Place::Path(path) = &resolved
+                        && let Some(Node::File(file)) = self.nodes.get(path)
+                    {
+                        files.insert(key, file.clone());
                     }
                 }
-                None if self.children(&path).is_empty() => {}
-                None => {
-                    if !Self::leave_out(&name, true) {
-                        self.collect(skill_root, &path, &format!("{out}/"), &ancestors, files)?;
+                None if self.is_dir(&at) => {
+                    if name == "metadata.json" || EXCLUDED_FOLDERS.contains(&name.as_str()) {
+                        continue;
                     }
+                    self.collect(&logical_child, root, Some(&key), &branch, files);
                 }
+                None => {}
             }
         }
-        Ok(())
     }
-
-    /// The file a symlink names, walking only paths inside `skill_root`.
-    fn follow(
-        &self,
-        skill_root: &str,
-        path: &str,
-        chain: &mut BTreeSet<String>,
-    ) -> Result<Followed, SkillError> {
-        if !chain.insert(path.to_owned()) {
-            return Ok(Followed::Skip);
-        }
-        let Some(Node::Symlink(target)) = self.node(path) else {
-            return Ok(Followed::Skip);
-        };
-        let target = target.clone();
-        if Path::new(&target).is_absolute() {
-            return Err(SkillError::AbsoluteSymlink {
-                path: Self::relative_to(skill_root, path).to_owned(),
-            });
-        }
-        let Some(resolved) = Self::join_link(Self::parent(path), &target) else {
-            return Ok(Followed::Skip);
-        };
-        if !Self::within(skill_root, &resolved) {
-            return Ok(Followed::Skip);
-        }
-        match self.node(&resolved) {
-            Some(Node::File(file)) => Ok(Followed::File(file.clone())),
-            Some(Node::Symlink(_)) => self.follow(skill_root, &resolved, chain),
-            None if !self.children(&resolved).is_empty() || resolved == skill_root => {
-                Ok(Followed::Dir(resolved))
-            }
-            None => Ok(Followed::Skip),
-        }
-    }
-
-    fn leave_out(name: &str, directory: bool) -> bool {
-        name == "metadata.json" || (directory && EXCLUDED_FOLDERS.contains(&name))
-    }
-
-    fn parent(path: &str) -> &str {
-        path.rsplit_once('/').map_or("", |(parent, _)| parent)
-    }
-
-    fn relative_to<'a>(root: &str, path: &'a str) -> &'a str {
-        if root.is_empty() {
-            path
-        } else {
-            path.strip_prefix(root)
-                .and_then(|rest| rest.strip_prefix('/'))
-                .unwrap_or(path)
-        }
-    }
-
-    fn within(root: &str, path: &str) -> bool {
-        root.is_empty() || path == root || path.starts_with(&format!("{root}/"))
-    }
-
-    /// `directory` joined with a relative link target. `None` when the target
-    /// climbs above the repository root.
-    fn join_link(directory: &str, target: &str) -> Option<String> {
-        let mut parts: Vec<&str> = if directory.is_empty() {
-            Vec::new()
-        } else {
-            directory.split('/').collect()
-        };
-        for part in target.split('/') {
-            match part {
-                "" | "." => {}
-                ".." => {
-                    parts.pop()?;
-                }
-                other => parts.push(other),
-            }
-        }
-        Some(parts.join("/"))
-    }
-}
-
-enum Followed {
-    File(SkillFile),
-    Dir(String),
-    Skip,
 }
 
 /// Why a source archive could not be read.
@@ -405,14 +493,6 @@ pub enum SkillError {
     Missing {
         path: SkillPath,
     },
-    /// `path` is the skill folder. It is never empty.
-    FolderSymlink {
-        path: String,
-    },
-    /// `path` is relative to the skill folder. The link target is absolute.
-    AbsoluteSymlink {
-        path: String,
-    },
     HashMismatch {
         expected: ContentHash,
         actual: ContentHash,
@@ -423,10 +503,6 @@ impl fmt::Display for SkillError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Missing { path } => write!(f, "not found at {path}"),
-            Self::FolderSymlink { path } => write!(f, "is a symlink at \"{path}\""),
-            Self::AbsoluteSymlink { path } => {
-                write!(f, "contains an absolute symlink at \"{path}\"")
-            }
             Self::HashMismatch { expected, actual } => write!(
                 f,
                 "does not match skills-lock.json: computedHash is {expected} but the fetched files hash to {actual}"

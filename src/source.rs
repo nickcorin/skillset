@@ -136,8 +136,8 @@ pub struct GitHub {
 }
 
 impl GitHub {
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
+    /// An HTTP client for `https://codeload.github.com/<owner>/<repo>/tar.gz/<commit>`.
+    pub fn codeload() -> Self {
         let agent = ureq::Agent::config_builder()
             .timeout_global(Some(REQUEST_TIMEOUT))
             .user_agent(concat!("skillset/", env!("CARGO_PKG_VERSION")))
