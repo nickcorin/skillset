@@ -369,26 +369,6 @@ fn chooses_the_flag_then_the_lock_then_the_default_folder() {
 }
 
 #[test]
-fn installs_repository_licenses_beside_each_skill() {
-    let memory = Memory::new(demo());
-    let project = Project::new();
-    project.write_lock(None, skills(&["pdf", "notes"]));
-
-    project.install(&memory).unwrap();
-
-    let license = BTreeMap::from([("LICENSE".to_owned(), SkillFile::new(LICENSE))]);
-    assert_eq!(
-        files_at(&project.path(".agents/skills/.licenses/pdf")),
-        license
-    );
-    assert_eq!(
-        files_at(&project.path(".agents/skills/.licenses/notes")),
-        license
-    );
-    assert!(absent(&project.path(".agents/skills/pdf/LICENSE")));
-}
-
-#[test]
 fn a_hash_mismatch_leaves_the_folder_untouched() {
     let memory = Memory::new(demo());
     let project = Project::new();
@@ -458,7 +438,7 @@ fn a_second_run_writes_nothing() {
 }
 
 #[test]
-fn a_dropped_skill_is_removed() {
+fn an_unlocked_entry_is_left_in_place() {
     let memory = Memory::new(demo());
     let project = Project::new();
     project.write_lock(None, skills(&["pdf", "notes"]));
@@ -466,34 +446,20 @@ fn a_dropped_skill_is_removed() {
     fs::create_dir_all(project.path(".agents/skills/stray")).unwrap();
     fs::write(project.path(".agents/skills/stray/note.txt"), b"stray\n").unwrap();
     project.age_files();
-    let pdf_modified = project
-        .state()
-        .remove(&PathBuf::from(".agents/skills/pdf/SKILL.md"))
-        .unwrap();
     project.write_lock(None, skills(&["pdf"]));
+    let before = project.state();
 
     project.install(&memory).unwrap();
 
-    assert!(absent(&project.path(".agents/skills/notes")));
-    assert!(absent(&project.path(".agents/skills/.licenses/notes")));
-    assert!(absent(&project.path(".agents/skills/stray")));
-    assert_eq!(
-        project
-            .state()
-            .remove(&PathBuf::from(".agents/skills/pdf/SKILL.md"))
-            .unwrap(),
-        pdf_modified
-    );
+    assert_eq!(project.state(), before);
 }
 
 #[test]
-#[ignore = "the fixture archive contains symlinked files in the skill"]
 fn an_npx_written_lock_installs() {
     let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/npx-skills");
     let repository =
         Repository::from_tar_gz(fs::File::open(fixtures.join("demo-skills.tar.gz")).unwrap())
             .unwrap();
-    let licenses = repository.license_files();
     let memory = Memory::empty().serving(
         "skillset-fixture-owner",
         "demo-skills",
@@ -517,11 +483,12 @@ fn an_npx_written_lock_installs() {
         files_at(&project.path(".agents/skills/release-notes")),
         files_at(&fixtures.join("installed-by-npx/release-notes"))
     );
-    assert!(!licenses.is_empty());
-    assert_eq!(
-        files_at(&project.path(".agents/skills/.licenses/pdf-tools")),
-        licenses
-    );
+    assert!(absent(
+        &project.path(".agents/skills/pdf-tools/broken-link.md")
+    ));
+    assert!(absent(
+        &project.path(".agents/skills/pdf-tools/outside-link.md")
+    ));
 }
 
 #[test]
@@ -569,31 +536,6 @@ fn a_symlink_in_the_install_folder_is_removed_without_being_followed() {
             .file_type()
             .is_dir()
     );
-}
-
-#[test]
-fn a_symlink_in_the_source_is_an_error() {
-    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/npx-skills");
-    let repository =
-        Repository::from_tar_gz(fs::File::open(fixtures.join("demo-skills.tar.gz")).unwrap())
-            .unwrap();
-    let memory = Memory::empty().serving(
-        "skillset-fixture-owner",
-        "demo-skills",
-        "b45dbefda7e1098d90f140b803059d6ecbc367dc",
-        repository,
-    );
-    let project = Project::new();
-    fs::copy(
-        fixtures.join("skills-lock.json"),
-        project.path("skills-lock.json"),
-    )
-    .unwrap();
-
-    let err = project.install(&memory).unwrap_err();
-
-    assert!(err.to_string().contains("broken-link.md"), "{err}");
-    assert!(absent(&project.path(".agents")));
 }
 
 #[test]

@@ -38,20 +38,13 @@ The folder has to be inside the lock file's folder. `skillset.installDir` must b
 
 `npx skills` writes the lock back with only `version` and `skills`, so the `skillset` object has to be added again after `npx skills add`, `remove` or `update`.
 
-The install folder belongs to skillset. An entry that is not a locked skill is removed, including a skill dropped from the lock and a symlink. A symlink is removed as itself and is never followed. On the way from the lock file's folder to the install folder, a symlink is replaced with a real directory.
-
-| Path | Contents |
-| --- | --- |
-| `<skill>/` | the skill's files, byte for byte as in the repository at the locked commit |
-| `.licenses/<skill>/` | license files from the root of that repository |
-
-License files are `LICENSE`, `LICENCE`, `COPYING` or `UNLICENSE` with any extension, and `LICENSE-*` or `LICENCE-*` with no extension, `.md` or `.txt`. A repository with no license file at its root is an error, and nothing is written. On Unix, a file the repository marks executable is installed executable.
+`<skill>/` holds that skill's files, byte for byte as in the repository at the locked commit. Anything else in the install folder is left as it is. Replacing a skill folder removes that folder without following a symlink. On Unix, a file the repository marks executable is installed executable.
 
 Each repository is downloaded from `https://codeload.github.com/<owner>/<repo>/tar.gz/<commit>`, so only public repositories work. The skill's files are hashed the way `npx skills` hashes them: SHA-256 over the files sorted by path, with `metadata.json`, `.git`, `__pycache__` and `__pypackages__` left out. The hash has to match `computedHash`. Text files are hashed with CRLF turned into LF; the installed bytes are the bytes from the repository.
 
-A symlink inside a skill folder is an error. An archive path component that is empty, `.` or `..`, or that contains `\` or `:`, is an error.
+A symlink in a skill is installed as the file it points to when that file stays inside the skill folder. A link that is broken, loops, or leaves the skill folder is left out. An absolute symlink is an error. An archive path component that is empty, `.` or `..`, or that contains `\` or `:`, is an error.
 
-Every skill is fetched and checked before the install folder changes. A folder that already matches the source byte for byte, including the executable bit, is not written, so a second run with the same lock writes nothing. A folder whose bytes or executable bits differ is rewritten.
+Every skill is fetched and checked before the install folder changes. A skill folder that already matches those files byte for byte, including the executable bit, is not written, so a second run with the same lock writes nothing.
 
 Only GitHub entries with a `commit`, `skillPath` and `computedHash` can be installed. A lock with any other entry, including a skill installed under a new name (`skillName`), is rejected before anything is downloaded.
 

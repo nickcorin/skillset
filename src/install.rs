@@ -1,10 +1,9 @@
 //! The install folder.
 //!
-//! `<skill>/` holds that skill's files. `.licenses/<skill>/` holds the license
-//! files from the root of its repository. Every other entry is removed. A symlink
-//! is removed as itself and is never followed.
+//! `<skill>/` holds that skill's files. Everything else in the install folder is
+//! left alone. Replacing a skill folder unlinks a symlink instead of following it.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
 use std::fmt;
@@ -20,7 +19,6 @@ use crate::skill::{Skill, SkillFile};
 use crate::source::{CommitSha, GitHubRepo, Source};
 
 const DEFAULT_INSTALL_DIR: &str = ".agents/skills";
-const LICENSES: &str = ".licenses";
 
 /// The folder a lock is restored into. It is always strictly inside the lock file's
 /// folder.
@@ -34,7 +32,6 @@ pub struct InstallFolder {
 struct LockedSkill {
     folder: FolderName,
     skill: Skill,
-    licenses: BTreeMap<String, SkillFile>,
 }
 
 /// A path with `.` and `..` collapsed, without asking the filesystem.
@@ -191,15 +188,13 @@ impl InstallFolder {
             self.create_root()
                 .map_err(|source| InstallError::io("create", &self.full(), source))?;
             for skill in skills {
-                let root = self.full();
-                self.place(&root.join(skill.folder.as_str()), skill.skill.files())?;
                 self.place(
-                    &root.join(LICENSES).join(skill.folder.as_str()),
-                    &skill.licenses,
+                    &self.full().join(skill.folder.as_str()),
+                    skill.skill.files(),
                 )?;
             }
         }
-        self.remove_others(&skills.iter().map(|skill| skill.folder.clone()).collect())
+        Ok(())
     }
 
     /// Creates the install folder. A symlink in the relative path is replaced.
@@ -351,85 +346,6 @@ impl InstallFolder {
         Ok(())
     }
 
-    fn remove_others(&self, kept: &BTreeSet<FolderName>) -> Result<(), InstallError> {
-        let Some(root) = self
-            .real_root()
-            .map_err(|source| InstallError::io("inspect", &self.full(), source))?
-        else {
-            return Ok(());
-        };
-        for entry in fs::read_dir(&root)
-            .and_then(|entries| entries.collect::<io::Result<Vec<_>>>())
-            .map_err(|source| InstallError::io("read", &root, source))?
-        {
-            let path = entry.path();
-            let name = entry.file_name();
-            let kept_name = name
-                .to_str()
-                .is_some_and(|name| kept.iter().any(|folder| folder.as_str() == name));
-            let result = if name == LICENSES {
-                self.retain_licenses(&path, kept)
-            } else if kept_name {
-                Ok(())
-            } else {
-                self.remove_at(&path)
-            };
-            result.map_err(|source| InstallError::io("remove", &path, source))?;
-        }
-        Ok(())
-    }
-
-    /// The install folder when every component below `base` is a real directory.
-    /// A symlink in that relative path is removed and its target is not opened.
-    fn real_root(&self) -> io::Result<Option<PathBuf>> {
-        if !self.base.as_os_str().is_empty() {
-            match Self::kind(&self.base)? {
-                Kind::Dir | Kind::Symlink => {}
-                Kind::Missing => return Ok(None),
-                Kind::Other => {
-                    return Err(io::Error::other(format!(
-                        "{} is not a directory",
-                        self.base.display()
-                    )));
-                }
-            }
-        }
-        let mut prefix = self.base.clone();
-        for component in self.relative.components() {
-            prefix.push(component);
-            match Self::kind(&prefix)? {
-                Kind::Dir => {}
-                Kind::Missing => return Ok(None),
-                Kind::Symlink | Kind::Other => {
-                    Self::remove_leaf(&prefix)?;
-                    return Ok(None);
-                }
-            }
-        }
-        Ok(Some(prefix))
-    }
-
-    fn retain_licenses(&self, path: &Path, kept: &BTreeSet<FolderName>) -> io::Result<()> {
-        match Self::kind(path)? {
-            Kind::Dir => {}
-            Kind::Missing => return Ok(()),
-            Kind::Symlink | Kind::Other => return Self::remove_leaf(path),
-        }
-        for entry in fs::read_dir(path)?.collect::<io::Result<Vec<_>>>()? {
-            let kept_name = entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| kept.iter().any(|folder| folder.as_str() == name));
-            if !kept_name {
-                self.remove_at(&entry.path())?;
-            }
-        }
-        if fs::read_dir(path)?.next().is_none() {
-            fs::remove_dir(path)?;
-        }
-        Ok(())
-    }
-
     fn kind(path: &Path) -> io::Result<Kind> {
         match fs::symlink_metadata(path) {
             Ok(metadata) if metadata.file_type().is_symlink() => Ok(Kind::Symlink),
@@ -513,55 +429,22 @@ impl LockedSkill {
 
     fn from_entry(entry: &LockEntry, repository: &Repository) -> Result<Self, InstallError> {
         match repository.skill(entry.skill_path(), entry.hash()) {
-            Ok(skill) => {
-                let licenses = repository.license_files();
-                if licenses.is_empty() {
-                    return Err(entry.failed(SkillFailure::NoLicense));
-                }
-                Ok(Self {
-                    folder: entry.folder().clone(),
-                    skill,
-                    licenses,
-                })
-            }
-            Err(err) => Err(entry.failed(SkillFailure::Repository(err))),
+            Ok(skill) => Ok(Self {
+                folder: entry.folder().clone(),
+                skill,
+            }),
+            Err(err) => Err(entry.failed(err)),
         }
     }
 }
 
 impl LockEntry {
-    fn failed(&self, source: SkillFailure) -> InstallError {
+    fn failed(&self, source: SkillError) -> InstallError {
         InstallError::Skill {
             name: self.name().to_owned(),
             repo: self.repo().clone(),
             commit: self.commit().clone(),
             source: Box::new(source),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum SkillFailure {
-    /// The repository rejected the skill.
-    Repository(SkillError),
-    /// The repository root has no license file.
-    NoLicense,
-}
-
-impl fmt::Display for SkillFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Repository(source) => source.fmt(f),
-            Self::NoLicense => f.write_str("has no license file at the repository root"),
-        }
-    }
-}
-
-impl Error for SkillFailure {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Repository(source) => Some(source),
-            Self::NoLicense => None,
         }
     }
 }
@@ -581,7 +464,7 @@ pub enum InstallError {
         name: String,
         repo: GitHubRepo,
         commit: CommitSha,
-        source: Box<SkillFailure>,
+        source: Box<SkillError>,
     },
     Io {
         action: &'static str,
