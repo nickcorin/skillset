@@ -4,15 +4,44 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 use clap::Parser;
+use skillset::fetch::GitHubTarballFetcher;
+use skillset::install::InstallCommand;
 
-use crate::cli::Cli;
+use crate::cli::{Cli, Command};
 
 const EXIT_FAILURE: u8 = 1;
 
 fn main() -> ExitCode {
-    match Cli::try_parse() {
-        Ok(_) => ExitCode::SUCCESS,
-        Err(err) => ExitCode::from(write_clap_error(&err, &mut io::stdout(), &mut io::stderr())),
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            return ExitCode::from(write_clap_error(&err, &mut io::stdout(), &mut io::stderr()));
+        }
+    };
+    let result = match cli.command {
+        Command::Install(args) => {
+            InstallCommand::new(args.lock, args.dir, GitHubTarballFetcher::new()).install()
+        }
+    };
+    match result {
+        Ok(report) => {
+            let mut stdout = io::stdout().lock();
+            let summary_written = write!(stdout, "{report}").and_then(|()| stdout.flush());
+            let mut stderr = io::stderr().lock();
+            let warnings_written = report
+                .warnings
+                .iter()
+                .try_for_each(|warning| writeln!(stderr, "warning: {warning}"));
+            if summary_written.is_ok() && warnings_written.is_ok() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(EXIT_FAILURE)
+            }
+        }
+        Err(err) => {
+            let _ = writeln!(io::stderr(), "error: {err}");
+            ExitCode::from(EXIT_FAILURE)
+        }
     }
 }
 
@@ -107,7 +136,7 @@ mod tests {
             b"\
 error: unexpected argument '--bogus' found
 
-Usage: skillset
+Usage: skillset <COMMAND>
 
 For more information, try '--help'.
 "

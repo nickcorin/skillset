@@ -1,0 +1,19 @@
+{
+  "version": 2,
+  "skills": {
+    "pdf-tools": {
+      "source": "skillset-fixture-owner/demo-skills",
+      "commit": "b45dbefda7e1098d90f140b803059d6ecbc367dc",
+      "sourceType": "github",
+      "skillPath": "skills/pdf-tools/SKILL.md",
+      "computedHash": "2be34cd34b36a1831c3df36e8c60fae86b73027c30a79245408706d4fadb926f"
+    },
+    "release-notes": {
+      "source": "skillset-fixture-owner/demo-skills",
+      "commit": "b45dbefda7e1098d90f140b803059d6ecbc367dc",
+      "sourceType": "github",
+      "skillPath": "skills/release-notes/SKILL.md",
+      "computedHash": "59020185261181b51a31b1b23f94d83ad098d66882fcd6e0567299ae4aa2c842"
+    }
+  }
+}

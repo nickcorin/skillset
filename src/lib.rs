@@ -2,5 +2,6 @@
 
 pub mod content_hash;
 pub mod fetch;
+pub mod install;
 pub mod lock;
 pub mod snapshot;

@@ -1,18 +1,42 @@
+use std::fs;
+use std::path::Path;
 use std::process::{Command, Output};
+
+use tempfile::TempDir;
 
 const HELP_OUTPUT: &str = "\
 Vendor agent skills from GitHub at pinned commits into a folder you choose.
 
-Usage: skillset
+Usage: skillset <COMMAND>
+
+Commands:
+  install  Restore every skill in skills-lock.json at the commit the lock records
+  help     Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help     Print help
   -V, --version  Print version
 ";
 
+const INSTALL_HELP_OUTPUT: &str = "\
+Restore every skill in skills-lock.json at the commit the lock records
+
+Usage: skillset install [OPTIONS]
+
+Options:
+      --lock <FILE>  Lock file to restore from [default: skills-lock.json]
+      --dir <DIR>    Install into this folder instead of the lock's skillset.installDir or .agents/skills
+  -h, --help         Print help
+";
+
 fn skillset(args: &[&str]) -> Output {
+    skillset_in(Path::new("."), args)
+}
+
+fn skillset_in(dir: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_skillset"))
         .args(args)
+        .current_dir(dir)
         .output()
         .expect("failed to execute skillset binary")
 }
@@ -72,7 +96,7 @@ fn no_args_prints_help_to_stderr_and_exits_two() {
 }
 
 #[test]
-fn unexpected_positional_argument_prints_error_to_stderr_and_exits_two() {
+fn unknown_subcommand_prints_error_to_stderr_and_exits_two() {
     let output = skillset(&["unknown"]);
 
     assert_eq!(output.status.code(), Some(2));
@@ -83,9 +107,9 @@ fn unexpected_positional_argument_prints_error_to_stderr_and_exits_two() {
     assert_eq!(
         String::from_utf8(output.stderr).expect("stderr is valid UTF-8"),
         "\
-error: unexpected argument 'unknown' found
+error: unrecognized subcommand 'unknown'
 
-Usage: skillset
+Usage: skillset <COMMAND>
 
 For more information, try '--help'.
 "
@@ -106,9 +130,88 @@ fn unknown_flag_prints_error_to_stderr_and_exits_two() {
         "\
 error: unexpected argument '--bogus' found
 
-Usage: skillset
+Usage: skillset <COMMAND>
 
 For more information, try '--help'.
 "
     );
+}
+
+#[test]
+fn install_help_prints_options_and_exits_zero() {
+    let output = skillset(&["install", "--help"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("stdout is valid UTF-8"),
+        INSTALL_HELP_OUTPUT
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).expect("stderr is valid UTF-8"),
+        ""
+    );
+}
+
+#[test]
+fn install_with_malformed_lock_prints_error_and_exits_one() {
+    let project = TempDir::new().expect("temp dir");
+    fs::write(
+        project.path().join("skills-lock.json"),
+        r#"{"version": 2, "skills": {"pdf": {"sourceType": "github"}}}"#,
+    )
+    .expect("write lock");
+
+    let output = skillset_in(project.path(), &["install"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("stdout is valid UTF-8"),
+        ""
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).expect("stderr is valid UTF-8"),
+        "error: skills-lock.json: skill \"pdf\" has no \"source\"\n"
+    );
+    assert!(!project.path().join(".agents").exists());
+}
+
+#[test]
+fn install_without_lock_prints_error_and_exits_one() {
+    let project = TempDir::new().expect("temp dir");
+
+    let output = skillset_in(project.path(), &["install", "--lock", "missing.json"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("stdout is valid UTF-8"),
+        ""
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr is valid UTF-8");
+    assert!(
+        stderr.starts_with("error: cannot read missing.json: "),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn install_with_empty_lock_reports_nothing_to_do_and_exits_zero() {
+    let project = TempDir::new().expect("temp dir");
+    fs::write(
+        project.path().join("skills-lock.json"),
+        r#"{"version": 2, "skills": {}}"#,
+    )
+    .expect("write lock");
+
+    let output = skillset_in(project.path(), &["install", "--dir", "vendor"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("stdout is valid UTF-8"),
+        "no skills to install into vendor\n"
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).expect("stderr is valid UTF-8"),
+        ""
+    );
+    assert!(!project.path().join("vendor").exists());
 }
