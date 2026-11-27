@@ -595,8 +595,7 @@ fn restores_locally_modified_skill() {
     project.write_lock(&Lock::new().skill("pdf", &source));
     project.install(&github).unwrap();
     fs::write(project.path(".agents/skills/pdf/SKILL.md"), "edited\n").unwrap();
-    fs::write(project.path(".agents/skills/pdf/stray.txt"), "stray\n").unwrap();
-    fs::create_dir(project.path(".agents/skills/pdf/empty")).unwrap();
+    fs::remove_file(project.path(".agents/skills/pdf/docs/crlf.md")).unwrap();
 
     let report = project.install(&github).unwrap();
 
@@ -604,6 +603,29 @@ fn restores_locally_modified_skill() {
         project.files(".agents/skills/pdf"),
         source.skill_files("pdf")
     );
+    assert_eq!(report.changes(), [("pdf", SkillChange::Updated)]);
+}
+
+#[test]
+fn removes_files_and_folders_added_inside_installed_skill() {
+    let source = SourceCommit::demo(FIRST);
+    let github = FakeGitHub::new().serving(&source);
+    let project = Project::new();
+    project.write_lock(&Lock::new().skill("pdf", &source));
+    project.install(&github).unwrap();
+
+    fs::write(project.path(".agents/skills/pdf/stray.txt"), "stray\n").unwrap();
+    let report = project.install(&github).unwrap();
+
+    assert_eq!(
+        project.files(".agents/skills/pdf"),
+        source.skill_files("pdf")
+    );
+    assert_eq!(report.changes(), [("pdf", SkillChange::Updated)]);
+
+    fs::create_dir(project.path(".agents/skills/pdf/empty")).unwrap();
+    let report = project.install(&github).unwrap();
+
     assert!(!project.path(".agents/skills/pdf/empty").exists());
     assert_eq!(report.changes(), [("pdf", SkillChange::Updated)]);
 }
