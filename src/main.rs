@@ -4,8 +4,8 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 use clap::Parser;
-use skillset::fetch::GitHubTarballFetcher;
-use skillset::install::InstallCommand;
+use skillset::install::InstallFolder;
+use skillset::source::GitHub;
 
 use crate::cli::{Cli, Command};
 
@@ -20,24 +20,11 @@ fn main() -> ExitCode {
     };
     let result = match cli.command {
         Command::Install(args) => {
-            InstallCommand::new(args.lock, args.dir, GitHubTarballFetcher::new()).install()
+            InstallFolder::install(&args.lock, args.dir.as_deref(), &GitHub::new())
         }
     };
     match result {
-        Ok(report) => {
-            let mut stdout = io::stdout().lock();
-            let summary_written = write!(stdout, "{report}").and_then(|()| stdout.flush());
-            let mut stderr = io::stderr().lock();
-            let warnings_written = report
-                .warnings
-                .iter()
-                .try_for_each(|warning| writeln!(stderr, "warning: {warning}"));
-            if summary_written.is_ok() && warnings_written.is_ok() {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(EXIT_FAILURE)
-            }
-        }
+        Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             let _ = writeln!(io::stderr(), "error: {err}");
             ExitCode::from(EXIT_FAILURE)

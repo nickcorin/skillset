@@ -1,19 +1,19 @@
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Read;
+use std::io;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use flate2::read::GzDecoder;
 use serde_json::{Value, json};
 use skillset::content_hash::ContentHash;
-use skillset::fetch::{FetchError, GitHubTarballFetcher, SourceFetcher};
-use skillset::install::{InstallCommand, InstallError, InstallReport, InstallWarning, SkillChange};
+use skillset::install::{DirectoryProblem, InstallError, InstallFolder, Missing};
 use skillset::lock::{CommitSha, GitHubRepo, Lockfile};
-use skillset::snapshot::{RepoSnapshot, SkillFile};
+use skillset::repository::{ArchiveError, Repository};
+use skillset::skill::SkillFile;
+use skillset::source::Source;
 use tempfile::TempDir;
 
 const REPO: &str = "acme/agent-skills";
@@ -21,7 +21,6 @@ const FIRST: &str = "1111111111111111111111111111111111111111";
 const SECOND: &str = "2222222222222222222222222222222222222222";
 const MIT_LICENSE: &[u8] = b"MIT License\n\nCopyright (c) 2026 Acme\n";
 
-/// A repository at one commit, as the fake GitHub serves it.
 #[derive(Clone)]
 struct SourceCommit {
     repo: &'static str,
@@ -30,8 +29,6 @@ struct SourceCommit {
 }
 
 impl SourceCommit {
-    /// A repository with a license, a README and two skills: `pdf` (nested
-    /// folders, an executable, CRLF text and binary data) and `notes`.
     fn demo(sha: &'static str) -> Self {
         Self {
             repo: REPO,
@@ -63,32 +60,31 @@ impl SourceCommit {
         self
     }
 
-    fn snapshot(&self) -> RepoSnapshot {
-        let mut snapshot = RepoSnapshot::new();
+    fn repository(&self) -> Repository {
+        let mut repository = Repository::new();
         for (path, file) in &self.files {
-            snapshot.insert_file(path, file.clone()).unwrap();
+            repository.add_file(path, file.clone()).unwrap();
         }
-        snapshot
+        repository
     }
 
-    /// The files of `skills/<skill>/`, keyed relative to that folder, as they
-    /// should appear once installed on this platform.
     fn skill_files(&self, skill: &str) -> BTreeMap<String, SkillFile> {
         let prefix = format!("skills/{skill}/");
         self.files
             .iter()
             .filter_map(|(path, file)| {
                 let relative = path.strip_prefix(&prefix)?;
-                let installed = SkillFile {
-                    contents: file.contents.clone(),
-                    executable: file.executable && cfg!(unix),
-                };
-                Some((relative.to_owned(), installed))
+                Some((
+                    relative.to_owned(),
+                    SkillFile {
+                        contents: file.contents.clone(),
+                        executable: file.executable && cfg!(unix),
+                    },
+                ))
             })
             .collect()
     }
 
-    /// The `skills-lock.json` entry `npx skills add` writes for `skills/<skill>/`.
     fn lock_entry(&self, skill: &str) -> Value {
         let files = self.skill_files(skill);
         let hash = ContentHash::of_files(
@@ -106,7 +102,6 @@ impl SourceCommit {
     }
 }
 
-/// A `skills-lock.json` being built for a test.
 struct Lock {
     json: Value,
 }
@@ -134,68 +129,92 @@ impl Lock {
     }
 }
 
-/// Serves source snapshots from memory and counts how often it is asked.
-struct FakeGitHub {
-    snapshots: BTreeMap<(String, String), RepoSnapshot>,
+struct Memory {
+    repositories: BTreeMap<(String, String), Repository>,
     fetches: Cell<usize>,
 }
 
-impl FakeGitHub {
+impl Memory {
     fn new() -> Self {
         Self {
-            snapshots: BTreeMap::new(),
+            repositories: BTreeMap::new(),
             fetches: Cell::new(0),
         }
     }
 
     fn serving(self, source: &SourceCommit) -> Self {
-        self.serving_snapshot(source.repo, source.sha, source.snapshot())
+        self.serving_repository(source.repo, source.sha, source.repository())
     }
 
-    fn serving_snapshot(mut self, repo: &str, commit: &str, snapshot: RepoSnapshot) -> Self {
-        self.snapshots
-            .insert((repo.to_owned(), commit.to_owned()), snapshot);
+    fn serving_repository(mut self, repo: &str, commit: &str, repository: Repository) -> Self {
+        self.repositories
+            .insert((repo.to_owned(), commit.to_owned()), repository);
         self
     }
 }
 
-impl SourceFetcher for &FakeGitHub {
-    fn fetch(&self, repo: &GitHubRepo, commit: &CommitSha) -> Result<RepoSnapshot, FetchError> {
+#[derive(Debug)]
+struct Unavailable {
+    repo: String,
+    commit: String,
+}
+
+impl std::fmt::Display for Unavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} at commit {} is not available",
+            self.repo, self.commit
+        )
+    }
+}
+
+impl std::error::Error for Unavailable {}
+
+impl Source for Memory {
+    type Error = Unavailable;
+
+    fn repository(&self, repo: &GitHubRepo, commit: &CommitSha) -> Result<Repository, Unavailable> {
         self.fetches.set(self.fetches.get() + 1);
-        self.snapshots
+        self.repositories
             .get(&(repo.to_string(), commit.to_string()))
             .cloned()
-            .ok_or_else(|| FetchError::Status {
-                url: GitHubTarballFetcher::tarball_url(repo, commit),
-                status: 404,
+            .ok_or(Unavailable {
+                repo: repo.to_string(),
+                commit: commit.to_string(),
             })
     }
 }
 
-/// A project folder holding a `skills-lock.json`.
 struct Project {
     root: TempDir,
+    dir: PathBuf,
 }
 
-/// One path in a project, as far as tests compare them.
 #[derive(Debug, PartialEq, Eq)]
 enum Node {
-    Folder,
+    Directory,
     File {
         contents: Vec<u8>,
         modified: SystemTime,
     },
+    Symlink(PathBuf),
 }
 
 impl Project {
     fn new() -> Self {
-        Self {
-            root: TempDir::new().unwrap(),
-        }
+        let root = TempDir::new().unwrap();
+        let dir = root.path().join("project");
+        fs::create_dir(&dir).unwrap();
+        Self { root, dir }
     }
 
     fn path(&self, relative: &str) -> PathBuf {
-        self.root.path().join(relative)
+        self.dir.join(relative)
+    }
+
+    fn outside(&self, name: &str) -> PathBuf {
+        self.root.path().join(name)
     }
 
     fn lock_path(&self) -> PathBuf {
@@ -206,52 +225,18 @@ impl Project {
         fs::write(self.lock_path(), format!("{:#}\n", lock.json)).unwrap();
     }
 
-    fn install(&self, github: &FakeGitHub) -> Result<InstallReport, InstallError> {
-        InstallCommand::new(self.lock_path(), None, github).install()
+    fn install(&self, source: &Memory) -> Result<(), InstallError> {
+        InstallFolder::install(&self.lock_path(), None, source)
     }
 
-    fn install_into(
-        &self,
-        github: &FakeGitHub,
-        dir: PathBuf,
-    ) -> Result<InstallReport, InstallError> {
-        InstallCommand::new(self.lock_path(), Some(dir), github).install()
+    fn install_into(&self, source: &Memory, dir: &str) -> Result<(), InstallError> {
+        InstallFolder::install(&self.lock_path(), Some(Path::new(dir)), source)
     }
 
-    /// The regular files under `relative`, keyed by `/`-separated relative path.
     fn files(&self, relative: &str) -> BTreeMap<String, SkillFile> {
-        Self::files_at(&self.path(relative))
+        files_at(&self.path(relative))
     }
 
-    fn files_at(folder: &Path) -> BTreeMap<String, SkillFile> {
-        let mut files = BTreeMap::new();
-        let mut pending = vec![(folder.to_path_buf(), String::new())];
-        while let Some((folder, prefix)) = pending.pop() {
-            for entry in fs::read_dir(&folder).unwrap() {
-                let entry = entry.unwrap();
-                let name = format!("{prefix}{}", entry.file_name().into_string().unwrap());
-                if entry.file_type().unwrap().is_dir() {
-                    pending.push((entry.path(), format!("{name}/")));
-                    continue;
-                }
-                #[cfg(unix)]
-                let executable = entry.metadata().unwrap().permissions().mode() & 0o111 != 0;
-                #[cfg(not(unix))]
-                let executable = false;
-                let contents = fs::read(entry.path()).unwrap();
-                files.insert(
-                    name,
-                    SkillFile {
-                        contents,
-                        executable,
-                    },
-                );
-            }
-        }
-        files
-    }
-
-    /// The names directly inside `relative`, sorted.
     fn entries(&self, relative: &str) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(self.path(relative))
             .unwrap()
@@ -261,37 +246,42 @@ impl Project {
         names
     }
 
-    /// Every path in the project with its contents and modification time.
     fn state(&self) -> BTreeMap<PathBuf, Node> {
         let mut state = BTreeMap::new();
-        let mut pending = vec![self.root.path().to_path_buf()];
+        let mut pending = vec![self.dir.clone()];
         while let Some(folder) = pending.pop() {
             for entry in fs::read_dir(&folder).unwrap() {
                 let entry = entry.unwrap();
                 let path = entry.path();
-                let relative = path.strip_prefix(self.root.path()).unwrap().to_path_buf();
-                if entry.file_type().unwrap().is_dir() {
-                    state.insert(relative, Node::Folder);
+                let relative = path.strip_prefix(&self.dir).unwrap().to_path_buf();
+                let file_type = entry.file_type().unwrap();
+                if file_type.is_symlink() {
+                    state.insert(relative, Node::Symlink(fs::read_link(&path).unwrap()));
+                } else if file_type.is_dir() {
+                    state.insert(relative, Node::Directory);
                     pending.push(path);
                 } else {
                     let modified = entry.metadata().unwrap().modified().unwrap();
-                    let contents = fs::read(&path).unwrap();
-                    state.insert(relative, Node::File { contents, modified });
+                    state.insert(
+                        relative,
+                        Node::File {
+                            contents: fs::read(&path).unwrap(),
+                            modified,
+                        },
+                    );
                 }
             }
         }
         state
     }
 
-    /// Sets the modification time of every file to a fixed time in the past, so a
-    /// later rewrite shows up even within the file system's time resolution.
     fn age_files(&self) {
         let past = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
         for (relative, node) in self.state() {
-            if let Node::File { .. } = node {
+            if matches!(node, Node::File { .. }) {
                 let file = fs::File::options()
                     .write(true)
-                    .open(self.root.path().join(relative))
+                    .open(self.dir.join(relative))
                     .unwrap();
                 file.set_modified(past).unwrap();
             }
@@ -299,27 +289,68 @@ impl Project {
     }
 }
 
-trait ReportSummary {
-    fn changes(&self) -> Vec<(&str, SkillChange)>;
+fn files_at(folder: &Path) -> BTreeMap<String, SkillFile> {
+    let mut files = BTreeMap::new();
+    let mut pending = vec![(folder.to_path_buf(), String::new())];
+    while let Some((folder, prefix)) = pending.pop() {
+        for entry in fs::read_dir(&folder).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().unwrap();
+            let path = format!("{prefix}{name}");
+            let file_type = entry.file_type().unwrap();
+            assert!(
+                !file_type.is_symlink(),
+                "{} is a symlink",
+                entry.path().display()
+            );
+            if file_type.is_dir() {
+                pending.push((entry.path(), format!("{path}/")));
+                continue;
+            }
+            #[cfg(unix)]
+            let executable = entry.metadata().unwrap().permissions().mode() & 0o111 != 0;
+            #[cfg(not(unix))]
+            let executable = false;
+            files.insert(
+                path,
+                SkillFile {
+                    contents: fs::read(entry.path()).unwrap(),
+                    executable,
+                },
+            );
+        }
+    }
+    files
 }
 
-impl ReportSummary for InstallReport {
-    fn changes(&self) -> Vec<(&str, SkillChange)> {
-        self.skills
-            .iter()
-            .map(|outcome| (outcome.folder_name.as_str(), outcome.change))
-            .collect()
+fn link(target: &Path, link: &Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    {
+        if target.is_dir() {
+            std::os::windows::fs::symlink_dir(target, link).unwrap();
+        } else {
+            std::os::windows::fs::symlink_file(target, link).unwrap();
+        }
     }
 }
 
+fn absent(path: &Path) -> bool {
+    matches!(
+        fs::symlink_metadata(path),
+        Err(err) if err.kind() == io::ErrorKind::NotFound
+    )
+}
+
 #[test]
-fn installs_files_byte_identical_into_default_folder() {
+fn installs_files_byte_for_byte_into_the_default_folder() {
     let source = SourceCommit::demo(FIRST);
-    let github = FakeGitHub::new().serving(&source);
+    let memory = Memory::new().serving(&source);
     let project = Project::new();
     project.write_lock(&Lock::new().skill("pdf", &source).skill("notes", &source));
 
-    let report = project.install(&github).unwrap();
+    project.install(&memory).unwrap();
 
     assert_eq!(
         project.files(".agents/skills/pdf"),
@@ -331,66 +362,56 @@ fn installs_files_byte_identical_into_default_folder() {
     );
     assert_eq!(
         project.entries(".agents/skills"),
-        [".licenses", ".skillset-manifest.json", "notes", "pdf"]
+        [".licenses", "notes", "pdf"]
     );
-    assert_eq!(report.install_dir, project.path(".agents/skills"));
-    assert_eq!(
-        report.changes(),
-        [("notes", SkillChange::Added), ("pdf", SkillChange::Added)]
-    );
-    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
 }
 
 #[test]
-fn install_dir_in_lock_replaces_default_folder() {
+fn chooses_dir_then_the_lock_install_dir_then_the_default() {
     let source = SourceCommit::demo(FIRST);
-    let github = FakeGitHub::new().serving(&source);
+    let memory = Memory::new().serving(&source);
+
+    let project = Project::new();
+    project.write_lock(&Lock::new().skill("pdf", &source));
+    project.install(&memory).unwrap();
+    assert_eq!(
+        project.files(".agents/skills/pdf"),
+        source.skill_files("pdf")
+    );
+
     let project = Project::new();
     project.write_lock(
         &Lock::new()
             .install_dir("vendor/skills")
             .skill("pdf", &source),
     );
-
-    let report = project.install(&github).unwrap();
-
-    assert_eq!(report.install_dir, project.path("vendor/skills"));
+    project.install(&memory).unwrap();
     assert_eq!(
         project.files("vendor/skills/pdf"),
         source.skill_files("pdf")
     );
-    assert!(!project.path(".agents").exists());
-}
+    assert!(absent(&project.path(".agents")));
 
-#[test]
-fn dir_override_replaces_lock_and_default_folders() {
-    let source = SourceCommit::demo(FIRST);
-    let github = FakeGitHub::new().serving(&source);
     let project = Project::new();
     project.write_lock(
         &Lock::new()
             .install_dir("vendor/skills")
             .skill("pdf", &source),
     );
-
-    let report = project
-        .install_into(&github, project.path("chosen"))
-        .unwrap();
-
-    assert_eq!(report.install_dir, project.path("chosen"));
+    project.install_into(&memory, "chosen").unwrap();
     assert_eq!(project.files("chosen/pdf"), source.skill_files("pdf"));
-    assert!(!project.path("vendor").exists());
-    assert!(!project.path(".agents").exists());
+    assert!(absent(&project.path("vendor")));
+    assert!(absent(&project.path(".agents")));
 }
 
 #[test]
-fn installs_source_license_beside_each_skill() {
+fn installs_the_repository_license_beside_each_skill() {
     let source = SourceCommit::demo(FIRST).with_file("COPYING", b"GPL text\n");
-    let github = FakeGitHub::new().serving(&source);
+    let memory = Memory::new().serving(&source);
     let project = Project::new();
     project.write_lock(&Lock::new().skill("pdf", &source).skill("notes", &source));
 
-    project.install(&github).unwrap();
+    project.install(&memory).unwrap();
 
     let licenses = BTreeMap::from([
         ("COPYING".to_owned(), SkillFile::new(*b"GPL text\n")),
@@ -405,160 +426,164 @@ fn installs_source_license_beside_each_skill() {
 }
 
 #[test]
-fn warns_when_source_has_no_license() {
+fn a_repository_without_a_license_file_is_an_error() {
     let source = SourceCommit::demo(FIRST).without("LICENSE");
-    let github = FakeGitHub::new().serving(&source);
+    let memory = Memory::new().serving(&source);
     let project = Project::new();
     project.write_lock(&Lock::new().skill("pdf", &source));
 
-    let report = project.install(&github).unwrap();
+    let err = project.install(&memory).unwrap_err();
 
     assert!(
-        matches!(report.warnings.as_slice(), [InstallWarning::NoLicenseFile { skill, .. }] if skill == "pdf"),
-        "{:?}",
-        report.warnings
+        matches!(err, InstallError::NoLicense { ref skill, .. } if skill == "pdf"),
+        "{err}"
     );
-    assert_eq!(
-        project.files(".agents/skills/pdf"),
-        source.skill_files("pdf")
-    );
-    assert!(!project.path(".agents/skills/.licenses").exists());
+    assert!(absent(&project.path(".agents")));
 }
 
 #[test]
-fn hash_mismatch_fails_and_leaves_install_folder_untouched() {
+fn a_hash_mismatch_leaves_the_install_folder_unchanged() {
     let first = SourceCommit::demo(FIRST);
     let second = SourceCommit::demo(SECOND)
         .with_file("skills/pdf/SKILL.md", b"# PDF, second commit\n")
         .with_file("skills/notes/SKILL.md", b"# Notes, second commit\n");
-    let github = FakeGitHub::new().serving(&first).serving(&second);
+    let memory = Memory::new().serving(&first).serving(&second);
     let project = Project::new();
     project.write_lock(&Lock::new().skill("pdf", &first).skill("notes", &first));
-    project.install(&github).unwrap();
+    project.install(&memory).unwrap();
 
     let mut tampered = second.lock_entry("pdf");
     tampered["computedHash"] = first.lock_entry("pdf")["computedHash"].clone();
     project.write_lock(&Lock::new().skill("notes", &second).entry("pdf", tampered));
     let before = project.state();
 
-    let err = project.install(&github).unwrap_err();
+    let err = project.install(&memory).unwrap_err();
 
     assert!(
-        matches!(&err, InstallError::HashMismatch { entry, .. } if entry.name == "pdf"),
+        matches!(err, InstallError::HashMismatch { ref skill, .. } if skill == "pdf"),
         "{err}"
     );
     assert_eq!(project.state(), before);
-}
 
-#[test]
-fn hash_mismatch_on_first_install_creates_nothing() {
-    let source = SourceCommit::demo(FIRST);
-    let github = FakeGitHub::new().serving(&source);
     let project = Project::new();
-    let mut tampered = source.lock_entry("pdf");
+    let mut tampered = first.lock_entry("pdf");
     tampered["computedHash"] = json!("0".repeat(64));
-    project.write_lock(&Lock::new().skill("notes", &source).entry("pdf", tampered));
-    let before = project.state();
-
-    let err = project.install(&github).unwrap_err();
-
+    project.write_lock(&Lock::new().skill("notes", &first).entry("pdf", tampered));
+    let err = project.install(&memory).unwrap_err();
     assert!(matches!(err, InstallError::HashMismatch { .. }), "{err}");
-    assert_eq!(project.state(), before);
-    assert!(!project.path(".agents").exists());
+    assert!(absent(&project.path(".agents")));
 }
 
 #[test]
-fn second_run_with_unchanged_lock_writes_nothing() {
+fn a_second_run_with_an_unchanged_lock_writes_nothing() {
     let source = SourceCommit::demo(FIRST);
-    let github = FakeGitHub::new().serving(&source);
+    let memory = Memory::new().serving(&source);
     let project = Project::new();
     project.write_lock(&Lock::new().skill("pdf", &source).skill("notes", &source));
-    project.install(&github).unwrap();
+    project.install(&memory).unwrap();
     project.age_files();
     let before = project.state();
 
-    let report = project.install(&github).unwrap();
+    project.install(&memory).unwrap();
 
     assert_eq!(project.state(), before);
-    assert_eq!(
-        report.changes(),
-        [
-            ("notes", SkillChange::Unchanged),
-            ("pdf", SkillChange::Unchanged)
-        ]
-    );
 }
 
 #[test]
-fn removes_skill_dropped_from_lock_and_keeps_unmanaged_folders() {
+fn removes_a_dropped_skill_and_anything_else_in_the_folder() {
     let source = SourceCommit::demo(FIRST);
-    let github = FakeGitHub::new().serving(&source);
+    let memory = Memory::new().serving(&source);
     let project = Project::new();
     project.write_lock(&Lock::new().skill("pdf", &source).skill("notes", &source));
-    project.install(&github).unwrap();
+    project.install(&memory).unwrap();
     fs::create_dir(project.path(".agents/skills/my-own")).unwrap();
     fs::write(project.path(".agents/skills/my-own/SKILL.md"), "# mine\n").unwrap();
+    fs::write(
+        project.path(".agents/skills/.skillset-manifest.json"),
+        "{}\n",
+    )
+    .unwrap();
+    project.age_files();
+    let pdf_before = project.files(".agents/skills/pdf");
 
     project.write_lock(&Lock::new().skill("pdf", &source));
-    let report = project.install(&github).unwrap();
+    project.install(&memory).unwrap();
 
-    assert_eq!(
-        project.entries(".agents/skills"),
-        [".licenses", ".skillset-manifest.json", "my-own", "pdf"]
-    );
+    assert_eq!(project.entries(".agents/skills"), [".licenses", "pdf"]);
     assert_eq!(project.entries(".agents/skills/.licenses"), ["pdf"]);
+    assert_eq!(project.files(".agents/skills/pdf"), pdf_before);
+    let kept = project.state();
+    let modified = match &kept[Path::new(".agents/skills/pdf/SKILL.md")] {
+        Node::File { modified, .. } => *modified,
+        other => panic!("expected a file, got {other:?}"),
+    };
+    assert_eq!(modified, UNIX_EPOCH + Duration::from_secs(1_000_000_000));
+    assert!(absent(&project.path(".agents/skills/notes")));
+    assert!(absent(&project.path(".agents/skills/my-own")));
+    assert!(absent(
+        &project.path(".agents/skills/.skillset-manifest.json")
+    ));
+}
+
+#[test]
+fn removes_a_symlink_in_the_install_folder_without_following_it() {
+    let source = SourceCommit::demo(FIRST);
+    let memory = Memory::new().serving(&source);
+    let project = Project::new();
+    project.write_lock(&Lock::new().skill("pdf", &source));
+    project.install(&memory).unwrap();
+
+    let outside = project.outside("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("secret.txt"), "secret\n").unwrap();
+    link(&outside, &project.path(".agents/skills/stray"));
+    link(
+        &outside.join("secret.txt"),
+        &project.path(".agents/skills/pdf/secret.txt"),
+    );
+
+    project.install(&memory).unwrap();
+
+    assert!(absent(&project.path(".agents/skills/stray")));
+    assert!(absent(&project.path(".agents/skills/pdf/secret.txt")));
+    assert_eq!(fs::read(outside.join("secret.txt")).unwrap(), b"secret\n");
     assert_eq!(
         project.files(".agents/skills/pdf"),
         source.skill_files("pdf")
     );
-    assert_eq!(
-        project.files(".agents/skills/my-own"),
-        BTreeMap::from([("SKILL.md".to_owned(), SkillFile::new(*b"# mine\n"))])
+    assert!(outside.join("secret.txt").is_file());
+
+    fs::remove_dir_all(project.path(".agents/skills")).unwrap();
+    link(&outside, &project.path(".agents/skills"));
+    project.install(&memory).unwrap();
+    assert_eq!(fs::read(outside.join("secret.txt")).unwrap(), b"secret\n");
+    assert!(absent(&outside.join("pdf")));
+    assert!(
+        !fs::symlink_metadata(project.path(".agents/skills"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
     );
     assert_eq!(
-        report.changes(),
-        [
-            ("notes", SkillChange::Removed),
-            ("pdf", SkillChange::Unchanged)
-        ]
+        project.files(".agents/skills/pdf"),
+        source.skill_files("pdf")
     );
-    let manifest: Value = serde_json::from_slice(
-        &fs::read(project.path(".agents/skills/.skillset-manifest.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(manifest, json!({ "version": 1, "skills": ["pdf"] }));
 }
 
 #[test]
-fn removing_every_skill_leaves_only_unmanaged_folders() {
-    let source = SourceCommit::demo(FIRST);
-    let github = FakeGitHub::new().serving(&source);
-    let project = Project::new();
-    project.write_lock(&Lock::new().skill("pdf", &source));
-    project.install(&github).unwrap();
-    fs::create_dir(project.path(".agents/skills/my-own")).unwrap();
-
-    project.write_lock(&Lock::new());
-    let report = project.install(&github).unwrap();
-
-    assert_eq!(project.entries(".agents/skills"), ["my-own"]);
-    assert_eq!(report.changes(), [("pdf", SkillChange::Removed)]);
-}
-
-#[test]
-fn new_commit_replaces_skill_folder_exactly() {
+fn replaces_a_skill_whose_installed_files_no_longer_match() {
     let first = SourceCommit::demo(FIRST);
     let second = SourceCommit::demo(SECOND)
         .without("skills/pdf/docs/crlf.md")
         .with_file("skills/pdf/docs/added.md", b"added\n")
         .with_file("LICENSE", b"Apache License\n");
-    let github = FakeGitHub::new().serving(&first).serving(&second);
+    let memory = Memory::new().serving(&first).serving(&second);
     let project = Project::new();
     project.write_lock(&Lock::new().skill("pdf", &first).skill("notes", &first));
-    project.install(&github).unwrap();
+    project.install(&memory).unwrap();
 
     project.write_lock(&Lock::new().skill("pdf", &second).skill("notes", &first));
-    let report = project.install(&github).unwrap();
+    project.install(&memory).unwrap();
 
     assert_eq!(
         project.files(".agents/skills/pdf"),
@@ -569,119 +594,67 @@ fn new_commit_replaces_skill_folder_exactly() {
         BTreeMap::from([("LICENSE".to_owned(), SkillFile::new(*b"Apache License\n"))])
     );
     assert_eq!(
-        report.changes(),
-        [
-            ("notes", SkillChange::Unchanged),
-            ("pdf", SkillChange::Updated)
-        ]
+        project.files(".agents/skills/notes"),
+        first.skill_files("notes")
     );
-    let pdf = report
-        .skills
-        .iter()
-        .find(|outcome| outcome.folder_name.as_str() == "pdf")
-        .unwrap();
-    let (repo, commit) = pdf.source.as_ref().unwrap();
-    assert_eq!(
-        (repo.to_string(), commit.to_string()),
-        (REPO.to_owned(), SECOND.to_owned())
-    );
-}
 
-#[test]
-fn restores_locally_modified_skill() {
-    let source = SourceCommit::demo(FIRST);
-    let github = FakeGitHub::new().serving(&source);
-    let project = Project::new();
-    project.write_lock(&Lock::new().skill("pdf", &source));
-    project.install(&github).unwrap();
     fs::write(project.path(".agents/skills/pdf/SKILL.md"), "edited\n").unwrap();
-    fs::remove_file(project.path(".agents/skills/pdf/docs/crlf.md")).unwrap();
-
-    let report = project.install(&github).unwrap();
-
+    fs::remove_file(project.path(".agents/skills/pdf/docs/added.md")).unwrap();
+    project.install(&memory).unwrap();
     assert_eq!(
         project.files(".agents/skills/pdf"),
-        source.skill_files("pdf")
+        second.skill_files("pdf")
     );
-    assert_eq!(report.changes(), [("pdf", SkillChange::Updated)]);
 }
 
 #[test]
-fn removes_files_and_folders_added_inside_installed_skill() {
-    let source = SourceCommit::demo(FIRST);
-    let github = FakeGitHub::new().serving(&source);
-    let project = Project::new();
-    project.write_lock(&Lock::new().skill("pdf", &source));
-    project.install(&github).unwrap();
-
-    fs::write(project.path(".agents/skills/pdf/stray.txt"), "stray\n").unwrap();
-    let report = project.install(&github).unwrap();
-
-    assert_eq!(
-        project.files(".agents/skills/pdf"),
-        source.skill_files("pdf")
-    );
-    assert_eq!(report.changes(), [("pdf", SkillChange::Updated)]);
-
-    fs::create_dir(project.path(".agents/skills/pdf/empty")).unwrap();
-    let report = project.install(&github).unwrap();
-
-    assert!(!project.path(".agents/skills/pdf/empty").exists());
-    assert_eq!(report.changes(), [("pdf", SkillChange::Updated)]);
-}
-
-#[test]
-fn installs_lock_written_by_npx_skills_like_npx_does() {
+fn installs_a_lock_written_by_npx_skills() {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/npx-skills");
     let tarball = fs::read(fixtures.join("demo-skills.tar.gz")).unwrap();
-    let snapshot = RepoSnapshot::from_tar_gz(tarball.as_slice()).unwrap();
-    let github = FakeGitHub::new().serving_snapshot(
+    let archive = Repository::from_tar_gz(tarball.as_slice()).unwrap();
+    let mut repository = Repository::new();
+    for (name, file) in archive.license_files() {
+        repository.add_file(&name, file).unwrap();
+    }
+    add_tree(
+        &mut repository,
+        "skills/pdf-tools",
+        &fixtures.join("installed-by-npx/pdf-tools"),
+    );
+    add_tree(
+        &mut repository,
+        "skills/release-notes",
+        &fixtures.join("installed-by-npx/release-notes"),
+    );
+    let memory = Memory::new().serving_repository(
         "skillset-fixture-owner/demo-skills",
         "b45dbefda7e1098d90f140b803059d6ecbc367dc",
-        snapshot,
+        repository,
     );
     let project = Project::new();
     fs::copy(fixtures.join("skills-lock.json"), project.lock_path()).unwrap();
 
-    let report = project.install(&github).unwrap();
+    project.install(&memory).unwrap();
 
-    let installed: BTreeMap<String, SkillFile> = project
-        .files(".agents/skills")
-        .into_iter()
-        .filter(|(path, _)| !path.starts_with('.'))
-        .collect();
     assert_eq!(
-        installed,
-        Project::files_at(&fixtures.join("installed-by-npx"))
+        project.files(".agents/skills/pdf-tools"),
+        files_at(&fixtures.join("installed-by-npx/pdf-tools"))
     );
     assert_eq!(
-        report.changes(),
-        [
-            ("pdf-tools", SkillChange::Added),
-            ("release-notes", SkillChange::Added)
-        ]
+        project.files(".agents/skills/release-notes"),
+        files_at(&fixtures.join("installed-by-npx/release-notes"))
     );
-
-    let mut archive = tar::Archive::new(GzDecoder::new(tarball.as_slice()));
-    let mut license = Vec::new();
-    archive
-        .entries()
-        .unwrap()
-        .map(Result::unwrap)
-        .find(|entry| entry.path().unwrap().ends_with("LICENSE"))
-        .unwrap()
-        .read_to_end(&mut license)
-        .unwrap();
+    let licenses = archive.license_files();
     for skill in ["pdf-tools", "release-notes"] {
         assert_eq!(
             project.files(&format!(".agents/skills/.licenses/{skill}")),
-            BTreeMap::from([("LICENSE".to_owned(), SkillFile::new(license.clone()))])
+            licenses
         );
     }
 }
 
 #[test]
-fn reads_lock_written_by_npx_skills_for_github_repositories() {
+fn reads_a_lock_written_by_npx_skills_for_github_repositories() {
     let path =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/npx-github/skills-lock.json");
 
@@ -726,82 +699,267 @@ fn reads_lock_written_by_npx_skills_for_github_repositories() {
 }
 
 #[test]
-fn fetches_each_repository_commit_once() {
-    let source = SourceCommit::demo(FIRST);
-    let github = FakeGitHub::new().serving(&source);
+fn a_symlink_in_the_source_skill_is_an_error() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/npx-skills");
+    let tarball = fs::read(fixtures.join("demo-skills.tar.gz")).unwrap();
+    let repository = Repository::from_tar_gz(tarball.as_slice()).unwrap();
+    let memory = Memory::new().serving_repository(
+        "skillset-fixture-owner/demo-skills",
+        "b45dbefda7e1098d90f140b803059d6ecbc367dc",
+        repository,
+    );
     let project = Project::new();
-    project.write_lock(&Lock::new().skill("pdf", &source).skill("notes", &source));
+    fs::copy(fixtures.join("skills-lock.json"), project.lock_path()).unwrap();
 
-    project.install(&github).unwrap();
+    let err = project.install(&memory).unwrap_err();
 
-    assert_eq!(github.fetches.get(), 1);
+    assert!(
+        matches!(err, InstallError::Symlink { ref path, .. } if path == "broken-link.md"),
+        "{err}"
+    );
+    assert!(absent(&project.path(".agents")));
 }
 
 #[test]
-fn unsupported_lock_entry_fails_before_fetching_or_writing() {
-    let source = SourceCommit::demo(FIRST);
-    let github = FakeGitHub::new().serving(&source);
-    let project = Project::new();
-    let local =
-        json!({ "source": "./my-skills", "sourceType": "local", "computedHash": "0".repeat(64) });
-    project.write_lock(&Lock::new().skill("pdf", &source).entry("mine", local));
-    let before = project.state();
-
-    let err = project.install(&github).unwrap_err();
-
-    assert!(matches!(err, InstallError::Lock(_)), "{err}");
-    assert_eq!(github.fetches.get(), 0);
-    assert_eq!(project.state(), before);
+fn rejects_archive_paths_that_are_not_plain_relative() {
+    for path in [
+        "repo/../x",
+        "repo/a/../b",
+        "repo/./a",
+        "repo/a//b",
+        "repo/a\\b",
+        "repo/a:b",
+        "repo/foo/bar:baz",
+    ] {
+        let archive = gzip_tar(path);
+        assert!(
+            matches!(
+                Repository::from_tar_gz(archive.as_slice()),
+                Err(ArchiveError::InvalidPath(_))
+            ),
+            "{path}"
+        );
+    }
 }
 
 #[test]
-fn fetch_failure_leaves_install_folder_untouched() {
-    let first = SourceCommit::demo(FIRST);
-    let unpublished = SourceCommit::demo(SECOND);
-    let github = FakeGitHub::new().serving(&first);
+fn rejects_an_install_dir_that_leaves_the_lock_folder() {
+    let source = SourceCommit::demo(FIRST);
+    let memory = Memory::new().serving(&source);
+
     let project = Project::new();
-    project.write_lock(&Lock::new().skill("pdf", &first));
-    project.install(&github).unwrap();
-    project.write_lock(&Lock::new().skill("pdf", &unpublished));
-    let before = project.state();
+    project.write_lock(&Lock::new().install_dir("../out").skill("pdf", &source));
+    let err = project.install(&memory).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            InstallError::Directory {
+                which: "skillset.installDir",
+                problem: DirectoryProblem::Outside,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert!(absent(&project.outside("out")));
+    assert!(project.lock_path().is_file());
 
-    let err = project.install(&github).unwrap_err();
+    let project = Project::new();
+    project.write_lock(&Lock::new().skill("pdf", &source));
+    let err = project.install_into(&memory, "../out").unwrap_err();
+    assert!(
+        matches!(
+            err,
+            InstallError::Directory {
+                which: "--dir",
+                problem: DirectoryProblem::Outside,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert!(absent(&project.outside("out")));
+    assert_eq!(memory.fetches.get(), 0);
 
-    assert!(matches!(err, InstallError::Fetch { .. }), "{err}");
-    assert_eq!(project.state(), before);
+    let project = Project::new();
+    let absolute = project.path("abs-target");
+    project.write_lock(&Lock::new().skill("pdf", &source));
+    let err = project
+        .install_into(&memory, absolute.to_str().unwrap())
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            InstallError::Directory {
+                problem: DirectoryProblem::Absolute,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert!(absent(&absolute));
+
+    let project = Project::new();
+    let absolute = project.path("abs-from-lock");
+    project.write_lock(
+        &Lock::new()
+            .install_dir(absolute.to_str().unwrap())
+            .skill("pdf", &source),
+    );
+    let err = project.install(&memory).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            InstallError::Directory {
+                which: "skillset.installDir",
+                problem: DirectoryProblem::Absolute,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert!(absent(&absolute));
+
+    let project = Project::new();
+    project.write_lock(&Lock::new().install_dir(".").skill("pdf", &source));
+    let err = project.install(&memory).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            InstallError::Directory {
+                problem: DirectoryProblem::Outside,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert!(project.lock_path().is_file());
+    assert!(absent(&project.path("pdf")));
+
+    let project = Project::new();
+    project.write_lock(
+        &Lock::new()
+            .install_dir("skills/../../etc")
+            .skill("pdf", &source),
+    );
+    let err = project.install(&memory).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            InstallError::Directory {
+                problem: DirectoryProblem::Outside,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert!(absent(&project.outside("etc")));
+
+    let project = Project::new();
+    project.write_lock(
+        &Lock::new()
+            .install_dir("vendor/../skills")
+            .skill("pdf", &source),
+    );
+    project.install(&memory).unwrap();
+    assert_eq!(project.files("skills/pdf"), source.skill_files("pdf"));
+    assert!(absent(&project.path("vendor")));
 }
 
 #[test]
-fn skill_missing_from_source_fails() {
+fn a_missing_skill_or_a_failed_fetch_writes_nothing() {
     let source = SourceCommit::demo(FIRST);
-    let github = FakeGitHub::new().serving(&source);
+    let memory = Memory::new().serving(&source);
     let project = Project::new();
     let mut entry = source.lock_entry("pdf");
     entry["skillPath"] = json!("skills/absent/SKILL.md");
     project.write_lock(&Lock::new().entry("absent", entry));
 
-    let err = project.install(&github).unwrap_err();
+    let err = project.install(&memory).unwrap_err();
 
-    assert!(matches!(err, InstallError::MissingSkill { .. }), "{err}");
-    assert!(!project.path(".agents").exists());
+    assert!(
+        matches!(
+            err,
+            InstallError::Missing {
+                missing: Missing::Folder,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert!(absent(&project.path(".agents")));
+
+    project.write_lock(&Lock::new().skill("pdf", &source));
+    project.install(&memory).unwrap();
+    let unpublished = SourceCommit::demo(SECOND);
+    project.write_lock(&Lock::new().skill("pdf", &unpublished));
+    let before = project.state();
+    let err = project.install(&memory).unwrap_err();
+    assert!(matches!(err, InstallError::Fetch { .. }), "{err}");
+    assert_eq!(project.state(), before);
 }
 
 #[test]
-fn unreadable_manifest_fails_without_changes() {
+fn an_unsupported_lock_entry_fails_before_fetching() {
     let source = SourceCommit::demo(FIRST);
-    let github = FakeGitHub::new().serving(&source);
+    let memory = Memory::new().serving(&source);
     let project = Project::new();
-    project.write_lock(&Lock::new().skill("pdf", &source));
-    fs::create_dir_all(project.path(".agents/skills")).unwrap();
-    fs::write(
-        project.path(".agents/skills/.skillset-manifest.json"),
-        "{\"version\": 1, \"skills\": [\"../x\"]}",
-    )
-    .unwrap();
-    let before = project.state();
+    let local = json!({
+        "source": "./my-skills",
+        "sourceType": "local",
+        "computedHash": "0".repeat(64)
+    });
+    project.write_lock(&Lock::new().skill("pdf", &source).entry("mine", local));
 
-    let err = project.install(&github).unwrap_err();
+    let err = project.install(&memory).unwrap_err();
 
-    assert!(matches!(err, InstallError::Manifest { .. }), "{err}");
-    assert_eq!(project.state(), before);
+    assert!(matches!(err, InstallError::Lock(_)), "{err}");
+    assert_eq!(memory.fetches.get(), 0);
+    assert!(absent(&project.path(".agents")));
+}
+
+fn add_tree(repository: &mut Repository, prefix: &str, directory: &Path) {
+    let mut pending = vec![(directory.to_path_buf(), prefix.to_owned())];
+    while let Some((directory, prefix)) = pending.pop() {
+        for entry in fs::read_dir(&directory).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().unwrap();
+            let path = format!("{prefix}/{name}");
+            let file_type = entry.file_type().unwrap();
+            if file_type.is_dir() {
+                pending.push((entry.path(), path));
+            } else if file_type.is_file() {
+                #[cfg(unix)]
+                let executable = entry.metadata().unwrap().permissions().mode() & 0o111 != 0;
+                #[cfg(not(unix))]
+                let executable = false;
+                let contents = fs::read(entry.path()).unwrap();
+                let file = if executable {
+                    SkillFile::executable(contents)
+                } else {
+                    SkillFile::new(contents)
+                };
+                repository.add_file(&path, file).unwrap();
+            } else {
+                panic!("{} is not a regular file", entry.path().display());
+            }
+        }
+    }
+}
+
+fn gzip_tar(path: &str) -> Vec<u8> {
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_mode(0o644);
+    header.set_size(1);
+    {
+        let gnu = header.as_gnu_mut().unwrap();
+        let bytes = path.as_bytes();
+        gnu.name[..bytes.len()].copy_from_slice(bytes);
+    }
+    header.set_cksum();
+    let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut builder = tar::Builder::new(encoder);
+    builder.append(&header, &b"x"[..]).unwrap();
+    builder.into_inner().unwrap().finish().unwrap()
 }

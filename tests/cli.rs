@@ -194,7 +194,7 @@ fn install_without_lock_prints_error_and_exits_one() {
 }
 
 #[test]
-fn install_with_empty_lock_reports_nothing_to_do_and_exits_zero() {
+fn install_with_empty_lock_prints_nothing_and_exits_zero() {
     let project = TempDir::new().expect("temp dir");
     fs::write(
         project.path().join("skills-lock.json"),
@@ -207,11 +207,37 @@ fn install_with_empty_lock_reports_nothing_to_do_and_exits_zero() {
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(
         String::from_utf8(output.stdout).expect("stdout is valid UTF-8"),
-        "no skills to install into vendor\n"
+        ""
     );
     assert_eq!(
         String::from_utf8(output.stderr).expect("stderr is valid UTF-8"),
         ""
     );
     assert!(!project.path().join("vendor").exists());
+}
+
+#[test]
+fn install_rejects_a_dir_that_leaves_the_lock_folder() {
+    let root = TempDir::new().expect("temp dir");
+    let project = root.path().join("project");
+    fs::create_dir(&project).expect("project dir");
+    fs::write(
+        project.join("skills-lock.json"),
+        r#"{"version": 2, "skills": {}}"#,
+    )
+    .expect("write lock");
+
+    let output = skillset_in(&project, &["install", "--dir", "../out"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("stdout is valid UTF-8"),
+        ""
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr is valid UTF-8");
+    assert!(
+        stderr.contains("../out") && stderr.contains("must stay inside"),
+        "{stderr}"
+    );
+    assert!(!root.path().join("out").exists());
 }
