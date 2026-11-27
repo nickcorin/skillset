@@ -384,21 +384,19 @@ impl InstallFolder {
     }
 
     /// Creates the install folder. A symlink on the way is followed. A file on
-    /// the way makes this fail, and the error names that file. `base` is only
-    /// created, never replaced.
+    /// the way makes this fail, and the error names that file's resolved path.
+    /// `base` is only created, never replaced.
     fn create_root(&self) -> Result<(), InstallError> {
         if let Some(base) = &self.base {
             fs::create_dir_all(base)
                 .map_err(|source| InstallError::io(IoAction::Create, base, source))?;
         }
         let mut prefix = self.base.clone().unwrap_or_default();
-        let mut walked = PathBuf::new();
         for component in self.relative.components() {
             prefix.push(component);
-            walked.push(component);
             if let Err(source) = EntryPath(&prefix).make_dir() {
                 let path = match EntryPath(&prefix).kind() {
-                    Ok(Kind::Other) => walked,
+                    Ok(Kind::Other) => prefix,
                     _ => self.full(),
                 };
                 return Err(InstallError::io(IoAction::Create, &path, source));

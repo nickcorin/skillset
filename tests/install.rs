@@ -18,6 +18,14 @@ use tempfile::TempDir;
 
 static CWD: Mutex<()> = Mutex::new(());
 
+struct RestoreCwd(PathBuf);
+
+impl Drop for RestoreCwd {
+    fn drop(&mut self) {
+        env::set_current_dir(&self.0).unwrap();
+    }
+}
+
 const OWNER: &str = "acme";
 const REPO: &str = "agent-skills";
 const COMMIT: &str = "1111111111111111111111111111111111111111";
@@ -341,15 +349,14 @@ fn chooses_the_flag_then_the_lock_then_the_default_folder() {
     project.write_lock(Some("vendor/skills"), skills(&["pdf"]));
     {
         let _guard = CWD.lock().expect("cwd lock");
-        let previous = env::current_dir().unwrap();
+        let _restore = RestoreCwd(env::current_dir().unwrap());
         env::set_current_dir(&project.dir).unwrap();
-        let result = InstallFolder::install(
+        InstallFolder::install(
             &project.dir.join("skills-lock.json"),
             Some(Path::new("chosen")),
             &memory,
-        );
-        env::set_current_dir(previous).unwrap();
-        result.unwrap();
+        )
+        .unwrap();
     }
     assert_eq!(files_at(&project.path("chosen/pdf")), installed(PDF));
     assert!(absent(&project.path("vendor")));
@@ -580,10 +587,37 @@ fn a_file_in_a_dir_path_is_not_replaced() {
         .unwrap_err();
 
     let message = err.to_string();
-    assert!(message.contains("cannot create notes.md:"), "{message}");
+    let notes = project.path("notes.md");
+    assert!(
+        message.contains(&format!("cannot create {}:", notes.display())),
+        "{message}"
+    );
     assert!(!message.contains("notes.md/skills"), "{message}");
     assert_eq!(fs::read(project.path("notes.md")).unwrap(), b"notes\n");
     assert!(project.path("notes.md").is_file());
+}
+
+#[test]
+fn a_file_blocking_a_relative_lock_is_named_from_the_lock_directory() {
+    let memory = Memory::new(demo());
+    let root = TempDir::new().unwrap();
+    let s12 = root.path().join("s12");
+    fs::create_dir(&s12).unwrap();
+    fs::write(s12.join(".agents"), b"not a folder\n").unwrap();
+    let lock = json!({"version": 2, "skills": skills(&["pdf"])});
+    fs::write(s12.join("skills-lock.json"), format!("{lock:#}\n")).unwrap();
+
+    let err = {
+        let _guard = CWD.lock().expect("cwd lock");
+        let _restore = RestoreCwd(env::current_dir().unwrap());
+        env::set_current_dir(root.path()).unwrap();
+        InstallFolder::install(Path::new("s12/skills-lock.json"), None, &memory).unwrap_err()
+    };
+
+    let message = err.to_string();
+    assert!(message.contains("cannot create s12/.agents:"), "{message}");
+    assert!(!message.contains("s12/.agents/skills"), "{message}");
+    assert_eq!(fs::read(s12.join(".agents")).unwrap(), b"not a folder\n");
 }
 
 #[test]
@@ -596,7 +630,11 @@ fn a_file_named_agents_is_not_replaced() {
     let err = project.install(&memory).unwrap_err();
 
     let message = err.to_string();
-    assert!(message.contains("cannot create .agents:"), "{message}");
+    let agents = project.path(".agents");
+    assert!(
+        message.contains(&format!("cannot create {}:", agents.display())),
+        "{message}"
+    );
     assert!(!message.contains(".agents/skills"), "{message}");
     assert_eq!(
         fs::read(project.path(".agents")).unwrap(),
