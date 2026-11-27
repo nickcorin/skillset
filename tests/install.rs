@@ -165,7 +165,7 @@ impl Source for Memory {
 }
 
 fn demo() -> Repository {
-    let mut repository = Repository::new();
+    let mut repository = Repository::default();
     repository
         .add_file("LICENSE", SkillFile::new(LICENSE))
         .unwrap();
@@ -492,7 +492,7 @@ fn an_npx_written_lock_installs() {
 }
 
 #[test]
-fn a_symlink_in_the_install_folder_is_removed_without_being_followed() {
+fn a_symlink_inside_a_skill_is_removed_without_being_followed() {
     let memory = Memory::new(demo());
     let project = Project::new();
     project.write_lock(None, skills(&["pdf"]));
@@ -511,15 +511,17 @@ fn a_symlink_in_the_install_folder_is_removed_without_being_followed() {
         files_at(&project.path(".agents/skills/pdf")),
         installed(PDF)
     );
+}
 
+#[test]
+fn a_symlinked_skills_folder_is_written_through() {
+    let memory = Memory::new(demo());
+    let project = Project::new();
+    project.write_lock(None, skills(&["pdf"]));
     let elsewhere = project.outside("elsewhere");
     fs::create_dir(&elsewhere).unwrap();
     fs::write(elsewhere.join("keep.txt"), b"keep\n").unwrap();
-    fs::rename(
-        project.path(".agents/skills"),
-        project.outside("saved-skills"),
-    )
-    .unwrap();
+    fs::create_dir_all(project.path(".agents")).unwrap();
     link(&elsewhere, &project.path(".agents/skills"));
 
     project.install(&memory).unwrap();
@@ -530,7 +532,11 @@ fn a_symlink_in_the_install_folder_is_removed_without_being_followed() {
         elsewhere
     );
     assert_eq!(files_at(&elsewhere.join("pdf")), installed(PDF));
+}
 
+#[test]
+fn a_symlinked_agents_folder_is_written_through() {
+    let memory = Memory::new(demo());
     let project = Project::new();
     let agents = project.outside("agents-target");
     fs::create_dir(&agents).unwrap();
@@ -543,7 +549,11 @@ fn a_symlink_in_the_install_folder_is_removed_without_being_followed() {
     assert_eq!(fs::read_link(project.path(".agents")).unwrap(), agents);
     assert_eq!(fs::read(agents.join("other.txt")).unwrap(), b"other\n");
     assert_eq!(files_at(&agents.join("skills/pdf")), installed(PDF));
+}
 
+#[test]
+fn a_symlinked_dir_is_written_through() {
+    let memory = Memory::new(demo());
     let project = Project::new();
     let chosen = project.outside("chosen-target");
     fs::create_dir(&chosen).unwrap();
@@ -559,6 +569,48 @@ fn a_symlink_in_the_install_folder_is_removed_without_being_followed() {
     assert_eq!(fs::read_link(&dir).unwrap(), chosen);
     assert_eq!(fs::read(chosen.join("other.txt")).unwrap(), b"other\n");
     assert_eq!(files_at(&chosen.join("pdf")), installed(PDF));
+}
+
+#[test]
+fn a_file_in_a_dir_path_is_not_replaced() {
+    let memory = Memory::new(demo());
+    let project = Project::new();
+    project.write_lock(None, skills(&["pdf"]));
+    fs::write(project.path("notes.md"), b"notes\n").unwrap();
+
+    let err = {
+        let _guard = CWD.lock().expect("cwd lock");
+        let previous = env::current_dir().unwrap();
+        env::set_current_dir(&project.dir).unwrap();
+        let result = InstallFolder::install(
+            &project.dir.join("skills-lock.json"),
+            Some(Path::new("notes.md/skills")),
+            &memory,
+        );
+        env::set_current_dir(previous).unwrap();
+        result.unwrap_err()
+    };
+
+    assert!(err.to_string().contains("cannot create"), "{err}");
+    assert_eq!(fs::read(project.path("notes.md")).unwrap(), b"notes\n");
+    assert!(project.path("notes.md").is_file());
+}
+
+#[test]
+fn a_file_named_agents_is_not_replaced() {
+    let memory = Memory::new(demo());
+    let project = Project::new();
+    project.write_lock(None, skills(&["pdf"]));
+    fs::write(project.path(".agents"), b"not a folder\n").unwrap();
+
+    let err = project.install(&memory).unwrap_err();
+
+    assert!(err.to_string().contains("cannot create"), "{err}");
+    assert_eq!(
+        fs::read(project.path(".agents")).unwrap(),
+        b"not a folder\n"
+    );
+    assert!(project.path(".agents").is_file());
 }
 
 #[test]
@@ -649,7 +701,7 @@ fn locked(name: &str, skill_path: &str, hash: &ContentHash) -> Value {
 
 #[test]
 fn an_absolute_symlink_is_left_out() {
-    let mut repository = Repository::new();
+    let mut repository = Repository::default();
     repository
         .add_file(
             "absolute/SKILL.md",
@@ -685,7 +737,7 @@ fn an_absolute_symlink_is_left_out() {
 
 #[test]
 fn a_link_through_a_link_is_copied() {
-    let mut repository = Repository::new();
+    let mut repository = Repository::default();
     repository
         .add_file(
             "through/SKILL.md",
@@ -724,7 +776,7 @@ fn a_link_through_a_link_is_copied() {
 
 #[test]
 fn a_skill_under_a_linked_parent_is_found() {
-    let mut repository = Repository::new();
+    let mut repository = Repository::default();
     repository
         .add_file(
             "hidden/widget/SKILL.md",
@@ -757,7 +809,7 @@ fn a_skill_under_a_linked_parent_is_found() {
 
 #[test]
 fn a_skill_folder_that_is_a_link_is_resolved() {
-    let mut repository = Repository::new();
+    let mut repository = Repository::default();
     repository
         .add_file(
             "outside/aliased/SKILL.md",

@@ -1,8 +1,9 @@
 //! The install folder.
 //!
 //! `<skill>/` holds that skill's files. Everything else in the install folder is
-//! left alone. A symlink on the way to that folder is followed. Replacing a skill
-//! folder unlinks a symlink instead of following it.
+//! left alone. A symlink on the way to that folder is followed. A file on that
+//! path is an error, and the file is left in place. Replacing a skill folder
+//! unlinks a symlink instead of following it.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -81,15 +82,12 @@ impl EntryPath<'_> {
         }
     }
 
-    /// A symlink is left in place so later writes follow it.
+    /// A symlink is left in place so later writes follow it. A file makes
+    /// `create_dir` fail, which leaves the file in place.
     fn make_dir(&self) -> io::Result<()> {
         match self.kind()? {
             Kind::Dir | Kind::Symlink => Ok(()),
-            Kind::Missing => fs::create_dir(self.0),
-            Kind::Other => {
-                self.remove_leaf()?;
-                fs::create_dir(self.0)
-            }
+            Kind::Missing | Kind::Other => fs::create_dir(self.0),
         }
     }
 
@@ -315,21 +313,30 @@ impl InstallFolder {
     }
 
     fn apply(&self, skills: &[LockedSkill]) -> Result<(), InstallError> {
-        if !skills.is_empty() {
-            self.create_root()
-                .map_err(|source| InstallError::io(IoAction::Create, &self.full(), source))?;
-            for skill in skills {
-                self.place(
-                    &self.full().join(skill.folder.as_str()),
-                    skill.skill.files(),
-                )?;
+        if skills.is_empty() {
+            return Ok(());
+        }
+        self.create_root()
+            .map_err(|source| InstallError::io(IoAction::Create, &self.full(), source))?;
+        for skill in skills {
+            let path = self.full().join(skill.folder.as_str());
+            let files = skill.skill.files();
+            if matches_files(&path, files)
+                .map_err(|source| InstallError::io(IoAction::Read, &path, source))?
+            {
+                continue;
             }
+            EntryPath(&path)
+                .remove_tree()
+                .map_err(|source| InstallError::io(IoAction::Remove, &path, source))?;
+            write_files(&path, files)
+                .map_err(|source| InstallError::io(IoAction::Write, &path, source))?;
         }
         Ok(())
     }
 
-    /// Creates the install folder. A symlink on the way is followed.
-    /// `base` is only created, never replaced.
+    /// Creates the install folder. A symlink on the way is followed. A file on
+    /// the way makes this fail. `base` is only created, never replaced.
     fn create_root(&self) -> io::Result<()> {
         if let Some(base) = &self.base {
             fs::create_dir_all(base)?;
@@ -341,105 +348,52 @@ impl InstallFolder {
         }
         Ok(())
     }
+}
 
-    fn place(&self, path: &Path, files: &BTreeMap<String, SkillFile>) -> Result<(), InstallError> {
-        if self
-            .matches_files(path, files)
-            .map_err(|source| InstallError::io(IoAction::Read, path, source))?
-        {
-            return Ok(());
-        }
-        self.remove_at(path)
-            .map_err(|source| InstallError::io(IoAction::Remove, path, source))?;
-        self.write(path, files)
-            .map_err(|source| InstallError::io(IoAction::Write, path, source))
+/// True when `path` is a real directory holding exactly `files`, byte for byte,
+/// including the executable bit. A symlink is not a directory, so it is not a match.
+fn matches_files(path: &Path, files: &BTreeMap<String, SkillFile>) -> io::Result<bool> {
+    if !matches!(EntryPath(path).kind()?, Kind::Dir) {
+        return Ok(false);
     }
-
-    /// True when `path` is a real directory holding exactly `files`, byte for byte,
-    /// including the executable bit. A symlink on the skill path is not followed.
-    fn matches_files(&self, path: &Path, files: &BTreeMap<String, SkillFile>) -> io::Result<bool> {
-        let root = self.full();
-        let Ok(relative) = path.strip_prefix(&root) else {
+    let mut found = BTreeMap::new();
+    if !EntryPath(path).collect_files(None, &mut found)? {
+        return Ok(false);
+    }
+    if found.len() != files.len() {
+        return Ok(false);
+    }
+    for (relative, file) in files {
+        let Some(found_file) = found.get(relative) else {
             return Ok(false);
         };
-        let mut cursor = root;
-        for component in relative.components() {
-            cursor.push(component);
-            if !matches!(EntryPath(&cursor).kind()?, Kind::Dir) {
-                return Ok(false);
-            }
-        }
-        let mut found = BTreeMap::new();
-        if !EntryPath(path).collect_files(None, &mut found)? {
+        if found_file.contents != file.contents {
             return Ok(false);
         }
-        if found.len() != files.len() {
+        #[cfg(unix)]
+        if found_file.executable != file.executable {
             return Ok(false);
         }
-        for (relative, file) in files {
-            let Some(found_file) = found.get(relative) else {
-                return Ok(false);
-            };
-            if found_file.contents != file.contents {
-                return Ok(false);
-            }
-            #[cfg(unix)]
-            if found_file.executable != file.executable {
-                return Ok(false);
-            }
-        }
-        Ok(true)
     }
+    Ok(true)
+}
 
-    fn remove_at(&self, path: &Path) -> io::Result<()> {
-        let root = self.full();
-        let relative = path.strip_prefix(&root).map_err(|_| {
-            io::Error::other(format!("{} is outside the install folder", path.display()))
-        })?;
-        let mut prefix = root;
-        let components: Vec<_> = relative.components().collect();
-        for (index, component) in components.iter().enumerate() {
-            prefix.push(component);
-            let last = index + 1 == components.len();
-            match EntryPath(&prefix).kind()? {
-                Kind::Missing => return Ok(()),
-                Kind::Dir if !last => {}
-                Kind::Dir => return EntryPath(&prefix).remove_tree(),
-                Kind::Symlink | Kind::Other => return EntryPath(&prefix).remove_leaf(),
-            }
+/// `directory` was just removed, so it is created empty and each file's parent is
+/// created under it.
+fn write_files(directory: &Path, files: &BTreeMap<String, SkillFile>) -> io::Result<()> {
+    fs::create_dir(directory)?;
+    for (relative, file) in files {
+        let mut target = directory.to_path_buf();
+        for part in relative.split('/') {
+            target.push(part);
         }
-        Ok(())
-    }
-
-    fn write(&self, directory: &Path, files: &BTreeMap<String, SkillFile>) -> io::Result<()> {
-        self.ensure(directory)?;
-        for (relative, file) in files {
-            let mut target = directory.to_path_buf();
-            for part in relative.split('/') {
-                target.push(part);
-            }
-            if let Some(parent) = target.parent() {
-                self.ensure(parent)?;
-            }
-            fs::write(&target, &file.contents)?;
-            EntryPath(&target).mark_executable(file.executable)?;
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
         }
-        Ok(())
+        fs::write(&target, &file.contents)?;
+        EntryPath(&target).mark_executable(file.executable)?;
     }
-
-    fn ensure(&self, path: &Path) -> io::Result<()> {
-        let root = self.full();
-        let relative = path.strip_prefix(&root).map_err(|_| {
-            io::Error::other(format!("{} is outside the install folder", path.display()))
-        })?;
-        EntryPath(&root).make_dir()?;
-        let mut prefix = root;
-        for component in relative.components() {
-            prefix.push(component);
-            EntryPath(&prefix).make_dir()?;
-        }
-        Ok(())
-    }
+    Ok(())
 }
 
 impl LockedSkill {
@@ -466,18 +420,12 @@ impl LockedSkill {
                 folder: entry.folder().clone(),
                 skill,
             }),
-            Err(err) => Err(entry.failed(err)),
-        }
-    }
-}
-
-impl LockEntry {
-    fn failed(&self, source: SkillError) -> InstallError {
-        InstallError::Skill {
-            name: self.name().to_owned(),
-            repo: self.repo().clone(),
-            commit: self.commit().clone(),
-            source: Box::new(source),
+            Err(source) => Err(InstallError::Skill {
+                name: entry.name().to_owned(),
+                repo: entry.repo().clone(),
+                commit: entry.commit().clone(),
+                source: Box::new(source),
+            }),
         }
     }
 }

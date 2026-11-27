@@ -15,13 +15,14 @@ use crate::skill::{Skill, SkillFile, SkillPath};
 const SYMLINK_HOP_LIMIT: u32 = 40;
 const EXCLUDED_FOLDERS: [&str; 3] = [".git", "__pycache__", "__pypackages__"];
 
+/// `metadata.json` is always left out. The excluded folders are left out only when
+/// `name` is a directory. A symlink is not a directory until its target is known.
+fn is_excluded(name: &str, is_directory: bool) -> bool {
+    name == "metadata.json" || (is_directory && EXCLUDED_FOLDERS.contains(&name))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct RepoPath(String);
-
-enum Relation<'a> {
-    Same,
-    Inside(&'a str),
-}
 
 impl RepoPath {
     fn parse(path: &str) -> Result<Self, RepoPathError> {
@@ -65,23 +66,10 @@ impl RepoPath {
         Some(Self(format!("{}/{}", self.0, child.as_str())))
     }
 
-    fn relative_to<'a>(&'a self, root: &Self) -> Option<Relation<'a>> {
-        if self == root {
-            Some(Relation::Same)
-        } else {
-            self.0
-                .strip_prefix(root.as_str())
-                .and_then(|rest| rest.strip_prefix('/'))
-                .map(Relation::Inside)
-        }
-    }
-
     fn within(&self, root: &Self) -> bool {
-        match self.relative_to(root) {
-            Some(Relation::Same) => true,
-            Some(Relation::Inside(rest)) => !rest.is_empty(),
-            None => false,
-        }
+        self.0
+            .strip_prefix(root.as_str())
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
     }
 }
 
@@ -149,10 +137,6 @@ pub struct Repository {
 }
 
 impl Repository {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn add_file(&mut self, path: &str, file: SkillFile) -> Result<(), ArchiveError> {
         self.insert(path, Node::File(file))
     }
@@ -171,8 +155,7 @@ impl Repository {
     /// when a skill is read.
     pub fn from_tar_gz(reader: impl Read) -> Result<Self, ArchiveError> {
         let mut archive = tar::Archive::new(GzDecoder::new(reader));
-        let mut repository = Self::new();
-        let mut top_folder: Option<String> = None;
+        let mut repository = Self::default();
         for entry in archive.entries().map_err(ArchiveError::Read)? {
             let mut entry = entry.map_err(ArchiveError::Read)?;
             let entry_type = entry.header().entry_type();
@@ -187,18 +170,9 @@ impl Repository {
                 .trim_end_matches('/')
                 .to_owned();
             RepoPath::parse(&path)?;
-            let (top, inner) = path.split_once('/').unwrap_or((&path, ""));
-            let inner = inner.to_owned();
-            match &top_folder {
-                None => top_folder = Some(top.to_owned()),
-                Some(expected) if expected != top => {
-                    return Err(ArchiveError::MultipleFolders {
-                        first: expected.clone(),
-                        second: top.to_owned(),
-                    });
-                }
-                Some(_) => {}
-            }
+            let Some(inner) = path.split_once('/').map(|(_, inner)| inner.to_owned()) else {
+                continue;
+            };
             if entry_type.is_dir() || inner.is_empty() {
                 continue;
             }
@@ -278,16 +252,12 @@ impl Repository {
         let parts = path
             .map(|path| path.components().map(str::to_owned).collect())
             .unwrap_or_default();
-        self.walk(None, parts, &mut 0)
+        self.walk(None, parts)
     }
 
     /// `cursor` is the directory already resolved. `None` is the repository root.
-    fn walk(
-        &self,
-        mut cursor: Option<RepoPath>,
-        mut parts: Vec<String>,
-        hops: &mut u32,
-    ) -> Option<Place> {
+    fn walk(&self, mut cursor: Option<RepoPath>, mut parts: Vec<String>) -> Option<Place> {
+        let mut hops = 0;
         let mut index = 0;
         while index < parts.len() {
             let component = parts[index].clone();
@@ -305,8 +275,8 @@ impl Repository {
                     };
                     match self.nodes.get(&next) {
                         Some(Node::Symlink(target)) => {
-                            *hops += 1;
-                            if *hops > SYMLINK_HOP_LIMIT {
+                            hops += 1;
+                            if hops > SYMLINK_HOP_LIMIT {
                                 return None;
                             }
                             if Path::new(target).is_absolute() {
@@ -403,16 +373,18 @@ impl Repository {
                 Some(prefix) => format!("{prefix}/{name}"),
                 None => name.clone(),
             };
+            let is_directory = match self.nodes.get(&at) {
+                Some(Node::File(_) | Node::Symlink(_)) => false,
+                None => self.is_dir(&at),
+            };
+            if is_excluded(&name, is_directory) {
+                continue;
+            }
             match self.nodes.get(&at) {
                 Some(Node::File(file)) => {
-                    if name != "metadata.json" {
-                        files.insert(key, file.clone());
-                    }
+                    files.insert(key, file.clone());
                 }
                 Some(Node::Symlink(_)) => {
-                    if name == "metadata.json" {
-                        continue;
-                    }
                     let Some(resolved) = self.canonicalize(logical_child.path()) else {
                         continue;
                     };
@@ -420,7 +392,7 @@ impl Repository {
                         continue;
                     }
                     if self.is_directory(&resolved) {
-                        if EXCLUDED_FOLDERS.contains(&name.as_str()) {
+                        if is_excluded(&name, true) {
                             continue;
                         }
                         self.collect(&logical_child, root, Some(&key), &branch, files);
@@ -430,10 +402,7 @@ impl Repository {
                         files.insert(key, file.clone());
                     }
                 }
-                None if self.is_dir(&at) => {
-                    if name == "metadata.json" || EXCLUDED_FOLDERS.contains(&name.as_str()) {
-                        continue;
-                    }
+                None if is_directory => {
                     self.collect(&logical_child, root, Some(&key), &branch, files);
                 }
                 None => {}
@@ -448,7 +417,6 @@ pub enum ArchiveError {
     Read(io::Error),
     Path(RepoPathError),
     NotUtf8 { lossy: String },
-    MultipleFolders { first: String, second: String },
     Unsupported { path: String },
 }
 
@@ -458,10 +426,6 @@ impl fmt::Display for ArchiveError {
             Self::Read(source) => write!(f, "cannot read archive: {source}"),
             Self::Path(source) => source.fmt(f),
             Self::NotUtf8 { lossy } => write!(f, "archive path {lossy:?} is not UTF-8"),
-            Self::MultipleFolders { first, second } => write!(
-                f,
-                "archive has more than one top-level folder ({first:?} and {second:?})"
-            ),
             Self::Unsupported { path } => {
                 write!(
                     f,
@@ -477,7 +441,7 @@ impl Error for ArchiveError {
         match self {
             Self::Read(source) => Some(source),
             Self::Path(source) => Some(source),
-            Self::NotUtf8 { .. } | Self::MultipleFolders { .. } | Self::Unsupported { .. } => None,
+            Self::NotUtf8 { .. } | Self::Unsupported { .. } => None,
         }
     }
 }

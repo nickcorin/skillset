@@ -149,7 +149,6 @@ impl LockEntry {
     }
 
     fn from_raw(name: String, raw: RawEntry) -> Result<Self, LockParseError> {
-        let SourceKind::Github = raw.source_type;
         if let Some(skill_name) = raw.skill_name {
             return Err(LockParseError::entry(
                 name,
@@ -199,6 +198,8 @@ struct RawSkillset {
 #[serde(rename_all = "camelCase")]
 struct RawEntry {
     source: String,
+    /// Kept so serde rejects a `sourceType` other than `github`.
+    #[expect(dead_code)]
     source_type: SourceKind,
     commit: String,
     skill_path: String,

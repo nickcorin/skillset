@@ -38,7 +38,7 @@ The folder has to be inside the lock file's folder. `skillset.installDir` must b
 
 `npx skills` writes the lock back with only `version` and `skills`, so the `skillset` object has to be added again after `npx skills add`, `remove` or `update`.
 
-`<skill>/` holds that skill's files, byte for byte as in the repository at the locked commit. Anything else in the install folder is left as it is. A symlink on the way to the install folder is followed. Replacing a skill folder removes that folder without following a symlink. On Unix, a file the repository marks executable is installed executable.
+`<skill>/` holds that skill's files, byte for byte as in the repository at the locked commit. Anything else in the install folder is left as it is. A symlink on the way to the install folder is followed. A file on that path is an error, and the file is left in place. Replacing a skill folder removes that folder without following a symlink. On Unix, a file the repository marks executable is installed executable.
 
 Each repository is downloaded from `https://codeload.github.com/<owner>/<repo>/tar.gz/<commit>`, so only public repositories work. The skill's files are hashed the way `npx skills` hashes them: SHA-256 over the files sorted by path, with `metadata.json`, `.git`, `__pycache__` and `__pypackages__` left out. The hash has to match `computedHash`. Text files are hashed with CRLF turned into LF; the installed bytes are the bytes from the repository.
 
