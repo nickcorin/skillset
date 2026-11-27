@@ -198,9 +198,9 @@ struct RawSkillset {
 #[serde(rename_all = "camelCase")]
 struct RawEntry {
     source: String,
-    /// Kept so serde rejects a `sourceType` other than `github`.
-    #[expect(dead_code)]
-    source_type: SourceKind,
+    /// Present so serde rejects a `sourceType` other than `github`.
+    #[serde(rename = "sourceType")]
+    _source_type: SourceKind,
     commit: String,
     skill_path: String,
     computed_hash: String,

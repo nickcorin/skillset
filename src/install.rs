@@ -172,6 +172,52 @@ impl EntryPath<'_> {
         }
         Ok(true)
     }
+
+    /// True when this path is a real directory holding exactly `files`, byte for
+    /// byte, including the executable bit. A symlink is not a directory.
+    fn holds(&self, files: &BTreeMap<String, SkillFile>) -> io::Result<bool> {
+        if !matches!(self.kind()?, Kind::Dir) {
+            return Ok(false);
+        }
+        let mut found = BTreeMap::new();
+        if !self.collect_files(None, &mut found)? {
+            return Ok(false);
+        }
+        if found.len() != files.len() {
+            return Ok(false);
+        }
+        for (relative, file) in files {
+            let Some(found_file) = found.get(relative) else {
+                return Ok(false);
+            };
+            if found_file.contents != file.contents {
+                return Ok(false);
+            }
+            #[cfg(unix)]
+            if found_file.executable != file.executable {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// This directory was just removed, so it is created empty and each file's
+    /// parent is created under it.
+    fn write(&self, files: &BTreeMap<String, SkillFile>) -> io::Result<()> {
+        fs::create_dir(self.0)?;
+        for (relative, file) in files {
+            let mut target = self.0.to_path_buf();
+            for part in relative.split('/') {
+                target.push(part);
+            }
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&target, &file.contents)?;
+            EntryPath(&target).mark_executable(file.executable)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -316,84 +362,50 @@ impl InstallFolder {
         if skills.is_empty() {
             return Ok(());
         }
-        self.create_root()
-            .map_err(|source| InstallError::io(IoAction::Create, &self.full(), source))?;
+        self.create_root()?;
         for skill in skills {
             let path = self.full().join(skill.folder.as_str());
+            let entry = EntryPath(&path);
             let files = skill.skill.files();
-            if matches_files(&path, files)
+            if entry
+                .holds(files)
                 .map_err(|source| InstallError::io(IoAction::Read, &path, source))?
             {
                 continue;
             }
-            EntryPath(&path)
+            entry
                 .remove_tree()
                 .map_err(|source| InstallError::io(IoAction::Remove, &path, source))?;
-            write_files(&path, files)
+            entry
+                .write(files)
                 .map_err(|source| InstallError::io(IoAction::Write, &path, source))?;
         }
         Ok(())
     }
 
     /// Creates the install folder. A symlink on the way is followed. A file on
-    /// the way makes this fail. `base` is only created, never replaced.
-    fn create_root(&self) -> io::Result<()> {
+    /// the way makes this fail, and the error names that file. `base` is only
+    /// created, never replaced.
+    fn create_root(&self) -> Result<(), InstallError> {
         if let Some(base) = &self.base {
-            fs::create_dir_all(base)?;
+            fs::create_dir_all(base)
+                .map_err(|source| InstallError::io(IoAction::Create, base, source))?;
         }
         let mut prefix = self.base.clone().unwrap_or_default();
+        let mut walked = PathBuf::new();
         for component in self.relative.components() {
             prefix.push(component);
-            EntryPath(&prefix).make_dir()?;
+            walked.push(component);
+            if let Err(source) = EntryPath(&prefix).make_dir() {
+                let path = match EntryPath(&prefix).kind() {
+                    Ok(Kind::Other) => walked,
+                    _ => self.full(),
+                };
+                return Err(InstallError::io(IoAction::Create, &path, source));
+            }
         }
         Ok(())
     }
-}
-
-/// True when `path` is a real directory holding exactly `files`, byte for byte,
-/// including the executable bit. A symlink is not a directory, so it is not a match.
-fn matches_files(path: &Path, files: &BTreeMap<String, SkillFile>) -> io::Result<bool> {
-    if !matches!(EntryPath(path).kind()?, Kind::Dir) {
-        return Ok(false);
-    }
-    let mut found = BTreeMap::new();
-    if !EntryPath(path).collect_files(None, &mut found)? {
-        return Ok(false);
-    }
-    if found.len() != files.len() {
-        return Ok(false);
-    }
-    for (relative, file) in files {
-        let Some(found_file) = found.get(relative) else {
-            return Ok(false);
-        };
-        if found_file.contents != file.contents {
-            return Ok(false);
-        }
-        #[cfg(unix)]
-        if found_file.executable != file.executable {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-/// `directory` was just removed, so it is created empty and each file's parent is
-/// created under it.
-fn write_files(directory: &Path, files: &BTreeMap<String, SkillFile>) -> io::Result<()> {
-    fs::create_dir(directory)?;
-    for (relative, file) in files {
-        let mut target = directory.to_path_buf();
-        for part in relative.split('/') {
-            target.push(part);
-        }
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&target, &file.contents)?;
-        EntryPath(&target).mark_executable(file.executable)?;
-    }
-    Ok(())
 }
 
 impl LockedSkill {

@@ -69,13 +69,10 @@ impl Project {
         InstallFolder::install(&self.dir.join("skills-lock.json"), None, source)
     }
 
+    /// `dir` is relative to this project. An absolute `dir` is used as given.
     fn install_into(&self, source: &Memory, dir: &str) -> Result<(), InstallError> {
-        let _guard = CWD.lock().expect("cwd lock");
-        InstallFolder::install(
-            &self.dir.join("skills-lock.json"),
-            Some(Path::new(dir)),
-            source,
-        )
+        let dir = self.dir.join(dir);
+        InstallFolder::install(&self.dir.join("skills-lock.json"), Some(&dir), source)
     }
 
     fn path(&self, relative: &str) -> PathBuf {
@@ -578,20 +575,13 @@ fn a_file_in_a_dir_path_is_not_replaced() {
     project.write_lock(None, skills(&["pdf"]));
     fs::write(project.path("notes.md"), b"notes\n").unwrap();
 
-    let err = {
-        let _guard = CWD.lock().expect("cwd lock");
-        let previous = env::current_dir().unwrap();
-        env::set_current_dir(&project.dir).unwrap();
-        let result = InstallFolder::install(
-            &project.dir.join("skills-lock.json"),
-            Some(Path::new("notes.md/skills")),
-            &memory,
-        );
-        env::set_current_dir(previous).unwrap();
-        result.unwrap_err()
-    };
+    let err = project
+        .install_into(&memory, "notes.md/skills")
+        .unwrap_err();
 
-    assert!(err.to_string().contains("cannot create"), "{err}");
+    let message = err.to_string();
+    assert!(message.contains("cannot create notes.md:"), "{message}");
+    assert!(!message.contains("notes.md/skills"), "{message}");
     assert_eq!(fs::read(project.path("notes.md")).unwrap(), b"notes\n");
     assert!(project.path("notes.md").is_file());
 }
@@ -605,7 +595,9 @@ fn a_file_named_agents_is_not_replaced() {
 
     let err = project.install(&memory).unwrap_err();
 
-    assert!(err.to_string().contains("cannot create"), "{err}");
+    let message = err.to_string();
+    assert!(message.contains("cannot create .agents:"), "{message}");
+    assert!(!message.contains(".agents/skills"), "{message}");
     assert_eq!(
         fs::read(project.path(".agents")).unwrap(),
         b"not a folder\n"

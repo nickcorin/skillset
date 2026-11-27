@@ -15,10 +15,16 @@ use crate::skill::{Skill, SkillFile, SkillPath};
 const SYMLINK_HOP_LIMIT: u32 = 40;
 const EXCLUDED_FOLDERS: [&str; 3] = [".git", "__pycache__", "__pypackages__"];
 
-/// `metadata.json` is always left out. The excluded folders are left out only when
-/// `name` is a directory. A symlink is not a directory until its target is known.
-fn is_excluded(name: &str, is_directory: bool) -> bool {
-    name == "metadata.json" || (is_directory && EXCLUDED_FOLDERS.contains(&name))
+/// A file or folder name inside a skill.
+struct EntryName<'a>(&'a str);
+
+impl EntryName<'_> {
+    /// `metadata.json` is always left out. The excluded folders are left out only
+    /// when this name is a directory. A symlink is not a directory until its target
+    /// is known.
+    fn is_excluded(&self, is_directory: bool) -> bool {
+        self.0 == "metadata.json" || (is_directory && EXCLUDED_FOLDERS.contains(&self.0))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -377,7 +383,7 @@ impl Repository {
                 Some(Node::File(_) | Node::Symlink(_)) => false,
                 None => self.is_dir(&at),
             };
-            if is_excluded(&name, is_directory) {
+            if EntryName(&name).is_excluded(is_directory) {
                 continue;
             }
             match self.nodes.get(&at) {
@@ -392,7 +398,7 @@ impl Repository {
                         continue;
                     }
                     if self.is_directory(&resolved) {
-                        if is_excluded(&name, true) {
+                        if EntryName(&name).is_excluded(true) {
                             continue;
                         }
                         self.collect(&logical_child, root, Some(&key), &branch, files);
