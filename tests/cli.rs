@@ -1,4 +1,18 @@
+#[cfg(target_os = "linux")]
+use std::fs::File;
+#[cfg(target_os = "linux")]
+use std::process::Stdio;
 use std::process::{Command, Output};
+
+const HELP_OUTPUT: &str = "\
+Vendor agent skills from GitHub at pinned commits into a folder you choose.
+
+Usage: skillset
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+";
 
 fn skillset(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_skillset"))
@@ -38,23 +52,33 @@ fn version_short_flag_prints_version_and_exits_zero() {
 }
 
 #[test]
-fn help_flag_prints_description_and_usage_and_exits_zero() {
+fn help_long_flag_prints_help_and_exits_zero() {
     let output = skillset(&["--help"]);
 
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(
+        String::from_utf8(output.stdout).expect("stdout is valid UTF-8"),
+        HELP_OUTPUT
+    );
+    assert_eq!(
         String::from_utf8(output.stderr).expect("stderr is valid UTF-8"),
         ""
     );
+}
 
-    let stdout = String::from_utf8(output.stdout).expect("stdout is valid UTF-8");
-    let lines: Vec<&str> = stdout.lines().collect();
-    assert!(
-        lines.contains(
-            &"Vendor agent skills from GitHub at pinned commits into a folder you choose."
-        )
+#[test]
+fn help_short_flag_prints_help_and_exits_zero() {
+    let output = skillset(&["-h"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("stdout is valid UTF-8"),
+        HELP_OUTPUT
     );
-    assert!(lines.contains(&"Usage: skillset"));
+    assert_eq!(
+        String::from_utf8(output.stderr).expect("stderr is valid UTF-8"),
+        ""
+    );
 }
 
 #[test]
@@ -62,19 +86,80 @@ fn no_args_prints_help_to_stderr_and_exits_two() {
     let output = skillset(&[]);
 
     assert_eq!(output.status.code(), Some(2));
-    assert!(output.stdout.is_empty());
-
-    let stderr = String::from_utf8(output.stderr).expect("stderr is valid UTF-8");
-    assert!(stderr.contains("Usage: skillset"));
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("stdout is valid UTF-8"),
+        ""
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).expect("stderr is valid UTF-8"),
+        HELP_OUTPUT
+    );
 }
 
 #[test]
-fn unknown_command_prints_error_to_stderr_and_exits_two() {
+fn unexpected_positional_argument_prints_error_to_stderr_and_exits_two() {
     let output = skillset(&["unknown"]);
 
     assert_eq!(output.status.code(), Some(2));
-    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("stdout is valid UTF-8"),
+        ""
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).expect("stderr is valid UTF-8"),
+        "\
+error: unexpected argument 'unknown' found
 
-    let stderr = String::from_utf8(output.stderr).expect("stderr is valid UTF-8");
-    assert!(stderr.contains("unexpected argument 'unknown' found"));
+Usage: skillset
+
+For more information, try '--help'.
+"
+    );
+}
+
+#[test]
+fn unknown_flag_prints_error_to_stderr_and_exits_two() {
+    let output = skillset(&["--bogus"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("stdout is valid UTF-8"),
+        ""
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).expect("stderr is valid UTF-8"),
+        "\
+error: unexpected argument '--bogus' found
+
+Usage: skillset
+
+For more information, try '--help'.
+"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn stdout_write_failure_exits_one() {
+    for flag in ["--version", "--help"] {
+        let dev_full = File::options()
+            .write(true)
+            .open("/dev/full")
+            .expect("failed to open /dev/full");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_skillset"))
+            .arg(flag)
+            .stdout(Stdio::from(dev_full))
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn skillset binary")
+            .wait_with_output()
+            .expect("failed to wait for skillset binary");
+
+        assert_eq!(output.status.code(), Some(1), "expected exit 1 for {flag}");
+        assert_eq!(
+            String::from_utf8(output.stderr).expect("stderr is valid UTF-8"),
+            ""
+        );
+    }
 }
