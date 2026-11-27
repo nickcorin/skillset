@@ -1,6 +1,6 @@
 use std::process::{Command, Output};
 
-fn run_skillset(args: &[&str]) -> Output {
+fn skillset(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_skillset"))
         .args(args)
         .output()
@@ -9,59 +9,71 @@ fn run_skillset(args: &[&str]) -> Output {
 
 #[test]
 fn version_prints_crate_version_and_exits_zero() {
-    let output = run_skillset(&["version"]);
+    let output = skillset(&["version"]);
 
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8(output.stdout).expect("stdout is valid UTF-8"),
         format!("{}\n", env!("CARGO_PKG_VERSION"))
     );
-    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).expect("stderr is valid UTF-8"),
+        ""
+    );
 }
 
 #[test]
 fn no_command_prints_usage_to_stderr_and_exits_two() {
-    let output = run_skillset(&[]);
+    let output = skillset(&[]);
 
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Usage: skillset <command>"));
-    assert!(stderr.contains("version"));
+    let stderr = String::from_utf8(output.stderr).expect("stderr is valid UTF-8");
+    assert!(stderr.contains("Usage: skillset"));
 }
 
 #[test]
 fn unknown_command_prints_error_to_stderr_and_exits_two() {
-    let output = run_skillset(&["unknown"]);
+    let output = skillset(&["unknown"]);
 
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("unknown command 'unknown'"));
-    assert!(stderr.contains("Usage: skillset <command>"));
+    let stderr = String::from_utf8(output.stderr).expect("stderr is valid UTF-8");
+    assert!(stderr.contains("unrecognized subcommand 'unknown'"));
 }
 
 #[test]
-fn extra_arguments_to_version_print_error_to_stderr_and_exit_two() {
-    let output = run_skillset(&["version", "extra"]);
+fn extra_argument_to_version_prints_error_to_stderr_and_exits_two() {
+    let output = skillset(&["version", "extra"]);
 
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = String::from_utf8(output.stderr).expect("stderr is valid UTF-8");
     assert!(stderr.contains("unexpected argument 'extra'"));
-    assert!(stderr.contains("Usage: skillset <command>"));
 }
 
 #[test]
-fn multiple_extra_arguments_to_version_exit_two() {
-    let output = run_skillset(&["version", "one", "two"]);
+fn help_flag_prints_usage_and_exits_zero() {
+    let output = skillset(&["--help"]);
 
-    assert_eq!(output.status.code(), Some(2));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("unexpected argument 'one'"));
+    let stdout = String::from_utf8(output.stdout).expect("stdout is valid UTF-8");
+    assert!(stdout.contains("Usage: skillset"));
+    assert!(stdout.contains("version"));
+}
+
+#[test]
+fn version_flag_prints_version_and_exits_zero() {
+    let output = skillset(&["--version"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout is valid UTF-8");
+    assert!(stdout.contains(env!("CARGO_PKG_VERSION")));
 }

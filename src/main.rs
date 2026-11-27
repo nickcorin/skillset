@@ -1,43 +1,28 @@
-use std::env;
-use std::ffi::OsString;
+mod cli;
+mod commands;
+
+use std::io;
 use std::process::ExitCode;
 
-const USAGE: &str = "\
-Usage: skillset <command>
+use clap::Parser;
 
-Commands:
-  version    Print the version";
-
-const EXIT_USAGE: u8 = 2;
+use crate::cli::{Cli, Command};
+use crate::commands::version::VersionPrinter;
 
 fn main() -> ExitCode {
-    run(env::args_os().skip(1))
-}
+    let cli = Cli::parse();
 
-fn run(mut args: impl Iterator<Item = OsString>) -> ExitCode {
-    let Some(command) = args.next() else {
-        eprintln!("{USAGE}");
-        return ExitCode::from(EXIT_USAGE);
+    let result = match cli.command {
+        Command::Version => {
+            VersionPrinter::new(env!("CARGO_PKG_VERSION"), io::stdout().lock()).print()
+        }
     };
 
-    match command.to_str() {
-        Some("version") => {
-            if let Some(extra) = args.next() {
-                eprintln!(
-                    "error: unexpected argument '{}' for 'version'\n\n{USAGE}",
-                    extra.to_string_lossy()
-                );
-                return ExitCode::from(EXIT_USAGE);
-            }
-            println!("{}", env!("CARGO_PKG_VERSION"));
-            ExitCode::SUCCESS
-        }
-        _ => {
-            eprintln!(
-                "error: unknown command '{}'\n\n{USAGE}",
-                command.to_string_lossy()
-            );
-            ExitCode::from(EXIT_USAGE)
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
         }
     }
 }
