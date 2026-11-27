@@ -8,3 +8,6 @@ authors = ["Nick Corin"]
 description = "Vendor agent skills from GitHub at pinned commits into a folder you choose."
 repository = "https://github.com/nickcorin/skillset"
 readme = "README.md"
+
+[dependencies]
+clap = { version = "4.6.10", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }

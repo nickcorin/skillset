@@ -1,33 +1,63 @@
-use std::env;
+use std::io::{self, Write};
 use std::process::ExitCode;
 
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(about)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Print the version this binary was built with
+    Version,
+}
+
+struct VersionCommand<W> {
+    version: &'static str,
+    output: W,
+}
+
+impl<W: Write> VersionCommand<W> {
+    fn print(mut self) -> io::Result<()> {
+        writeln!(self.output, "{}", self.version)
+    }
+}
+
 fn main() -> ExitCode {
-    let mut args = env::args().skip(1);
-    match args.next().as_deref() {
-        Some("version") => {
-            if args.next().is_some() {
-                eprintln!("usage: skillset version");
-                return ExitCode::from(2);
-            }
-            println!("{}", env!("CARGO_PKG_VERSION"));
-            ExitCode::SUCCESS
+    let cli = Cli::parse();
+    let result = match cli.command {
+        Command::Version => VersionCommand {
+            version: env!("CARGO_PKG_VERSION"),
+            output: io::stdout(),
         }
-        Some(command) => {
-            eprintln!("unrecognized command `{command}`");
-            eprintln!("{}", usage());
-            ExitCode::from(2)
-        }
-        None => {
-            eprintln!("{}", usage());
-            ExitCode::from(2)
+        .print(),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
         }
     }
 }
 
-fn usage() -> &'static str {
-    "\
-usage: skillset <command>
+#[cfg(test)]
+mod tests {
+    use super::VersionCommand;
 
-commands:
-  version    print the version this binary was built with"
+    #[test]
+    fn version_command_writes_the_version_and_a_newline() {
+        let mut output = Vec::new();
+        VersionCommand {
+            version: "1.2.3",
+            output: &mut output,
+        }
+        .print()
+        .unwrap();
+        assert_eq!(output, b"1.2.3\n");
+    }
 }
