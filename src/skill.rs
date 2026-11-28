@@ -35,7 +35,7 @@ impl Skill {
     }
 
     pub fn write(&self, dir: &Path, files: &[SkillFile]) -> Result<(), Error> {
-        let dest = dir.join(&self.name);
+        let dest = dir.join(self.folder());
         let io = |path: &Path, source| Error::Io {
             path: path.to_path_buf(),
             source,
@@ -58,6 +58,29 @@ impl Skill {
             .map_err(|source| io(&path, source))?;
         }
         Ok(())
+    }
+
+    fn folder(&self) -> String {
+        let mut replaced = String::new();
+        let mut gap = false;
+        for ch in self.name.to_lowercase().chars() {
+            if ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '.' || ch == '_' {
+                replaced.push(ch);
+                gap = false;
+            } else if !gap {
+                replaced.push('-');
+                gap = true;
+            }
+        }
+        let mut folder: String = replaced
+            .trim_matches(['.', '-'])
+            .chars()
+            .take(255)
+            .collect();
+        if folder.is_empty() {
+            folder = "unnamed-skill".to_string();
+        }
+        folder
     }
 
     fn download(&self) -> Result<Vec<u8>, Error> {
@@ -427,6 +450,37 @@ mod tests {
             }
             other => panic!("{other}"),
         }
+    }
+
+    #[test]
+    fn names_install_into_sanitized_folders_inside_the_install_dir() {
+        let root = temp_dir();
+        let dir = root.join("skills");
+        fs::create_dir_all(&dir).expect("dir");
+        let outside = root.join("victim");
+        fs::write(&outside, b"outside").expect("outside");
+        let sibling = dir.join("keep.txt");
+        fs::write(&sibling, b"keep").expect("keep");
+        let files = [skill_file("SKILL.md", b"hello\n", false)];
+        for (name, folder) in [
+            ("My Skill", "my-skill"),
+            ("../victim", "victim"),
+            ("C:", "c"),
+            ("ev/il", "ev-il"),
+        ] {
+            let mut skill = sample("skill/SKILL.md");
+            skill.name = name.to_string();
+            skill.write(&dir, &files).expect(name);
+            let installed = dir.join(folder).join("SKILL.md");
+            assert_eq!(
+                installed.parent().and_then(|path| path.parent()),
+                Some(dir.as_path())
+            );
+            assert_eq!(fs::read(&installed).expect("read"), b"hello\n");
+            assert_eq!(fs::read(&outside).expect("outside"), b"outside");
+            assert_eq!(fs::read(&sibling).expect("keep"), b"keep");
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

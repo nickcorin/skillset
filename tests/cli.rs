@@ -163,13 +163,18 @@ fn install_without_lock_does_not_create_the_requested_dir() {
 #[test]
 fn version_one_lock_exits_nonzero_and_does_not_create_the_install_dir() {
     let dir = workspace();
-    fs::write(dir.join("skills-lock.json"), r#"{"version":1,"skills":{}}"#).expect("lock");
+    fs::write(
+        dir.join("skills-lock.json"),
+        r#"{"version":1,"skills":{"My Skill":{"source":"owner/repo"}}}"#,
+    )
+    .expect("lock");
     let output = skillset_in(&dir, &["install"]);
     let stderr = String::from_utf8(output.stderr).expect("stderr is valid UTF-8");
 
     assert_ne!(output.status.code(), Some(0));
     assert!(stderr.contains("unsupported lock file"), "{stderr}");
     assert!(stderr.contains("version 1"), "{stderr}");
+    assert!(!stderr.contains("commit"), "{stderr}");
     assert!(!dir.join(".agents/skills").exists());
     let _ = fs::remove_dir_all(&dir);
 }

@@ -29,7 +29,7 @@ enum SourceType {
 struct Entry {
     source: String,
     #[serde(rename = "sourceType")]
-    source_type: SourceType,
+    _source_type: SourceType,
     commit: String,
     #[serde(rename = "skillPath")]
     skill_path: String,
@@ -45,27 +45,23 @@ impl Lockfile {
             path: path.to_path_buf(),
             source,
         })?;
-        let document: Document =
+        let value: serde_json::Value =
             serde_json::from_str(&text).map_err(|err| Error::UnsupportedLock(err.to_string()))?;
+        if let Some(version) = value.get("version").and_then(serde_json::Value::as_u64)
+            && version != 2
+        {
+            return Err(Error::UnsupportedLock(format!("version {version}")));
+        }
+        let document: Document =
+            serde_json::from_value(value).map_err(|err| Error::UnsupportedLock(err.to_string()))?;
         let reject = |message: String| Error::UnsupportedLock(message);
         if document.version != 2 {
             return Err(reject(format!("version {}", document.version)));
         }
         let mut skills = Vec::with_capacity(document.skills.len());
         for (name, entry) in document.skills {
-            if name.is_empty()
-                || name == "."
-                || name == ".."
-                || name.contains('/')
-                || name.contains('\\')
-            {
-                return Err(reject(format!("invalid skill name {name:?}")));
-            }
             if entry.skill_name.is_some() {
                 return Err(reject(format!("skill {name} is renamed")));
-            }
-            match entry.source_type {
-                SourceType::Github => {}
             }
             if entry.commit.is_empty() {
                 return Err(reject(format!("skill {name} is missing a commit")));
@@ -97,6 +93,7 @@ mod tests {
 
     use super::Lockfile;
     use crate::error::Error;
+    use crate::skill::SkillFile;
 
     fn temp_path() -> PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -200,17 +197,30 @@ mod tests {
     }
 
     #[test]
-    fn bad_skill_key_errors_and_deletes_nothing() {
+    fn skill_keys_install_under_sanitized_names_and_leave_the_outside_alone() {
         let root = temp_path();
         fs::create_dir_all(&root).expect("root");
         let install = root.join("skills");
         fs::create_dir_all(&install).expect("install");
         fs::write(install.join("keep.txt"), b"keep").expect("keep");
-        fs::write(root.join("x"), b"victim").expect("victim");
-        fs::write(root.join("abs-victim"), b"abs").expect("abs");
+        fs::write(root.join("victim"), b"outside").expect("victim");
+        fs::write(root.join("x"), b"x").expect("x");
         let absolute = root.join("abs-victim");
-        let absolute = absolute.to_str().expect("utf-8");
-        for key in ["../x", absolute, "", ".", "..", "a/b", "a\\b"] {
+        fs::write(&absolute, b"abs").expect("abs");
+        let absolute = absolute.to_str().expect("utf-8").to_string();
+        let cases = [
+            ("My Skill", "my-skill"),
+            ("../victim", "victim"),
+            ("../x", "x"),
+            ("C:", "c"),
+            ("ev/il", "ev-il"),
+            ("", "unnamed-skill"),
+            (".", "unnamed-skill"),
+            ("..", "unnamed-skill"),
+            ("a/b", "a-b"),
+            ("a\\b", "a-b"),
+        ];
+        for (key, folder) in cases {
             let json = serde_json::json!({
                 "version": 2,
                 "skills": {
@@ -225,22 +235,82 @@ mod tests {
             });
             let path = root.join("skills-lock.json");
             fs::write(&path, json.to_string()).expect("lock");
-            let parsed = Lockfile::read(&path);
-            if let Ok(lock) = &parsed {
-                for skill in &lock.skills {
-                    let _ = skill.write(&install, &[]);
-                }
-            }
-            let err = parsed.expect_err(key);
-            assert!(matches!(err, Error::UnsupportedLock(_)), "{key} -> {err}");
-            assert!(
-                err.to_string().contains(&format!("{key:?}")),
-                "{key} -> {err}"
+            let lock = Lockfile::read(&path).expect(key);
+            assert_eq!(lock.skills[0].name, key);
+            lock.skills[0]
+                .write(
+                    &install,
+                    &[SkillFile {
+                        path: "SKILL.md".to_string(),
+                        content: b"hello\n".to_vec(),
+                        executable: false,
+                    }],
+                )
+                .expect(key);
+            let installed = install.join(folder).join("SKILL.md");
+            assert_eq!(
+                installed.parent().and_then(|path| path.parent()),
+                Some(install.as_path()),
+                "{key}"
             );
+            assert_eq!(fs::read(&installed).expect("skill"), b"hello\n");
             assert_eq!(fs::read(install.join("keep.txt")).expect("keep"), b"keep");
-            assert_eq!(fs::read(root.join("x")).expect("victim"), b"victim");
+            assert_eq!(fs::read(root.join("victim")).expect("victim"), b"outside");
+            assert_eq!(fs::read(root.join("x")).expect("x"), b"x");
             assert_eq!(fs::read(root.join("abs-victim")).expect("abs"), b"abs");
         }
+        let json = serde_json::json!({
+            "version": 2,
+            "skills": {
+                absolute.clone(): {
+                    "source": "owner/repo",
+                    "sourceType": "github",
+                    "commit": "abc",
+                    "skillPath": "SKILL.md",
+                    "computedHash": "abc"
+                }
+            }
+        });
+        fs::write(root.join("skills-lock.json"), json.to_string()).expect("lock");
+        let lock = Lockfile::read(&root.join("skills-lock.json")).expect("absolute");
+        assert_eq!(lock.skills[0].name, absolute);
+        lock.skills[0]
+            .write(
+                &install,
+                &[SkillFile {
+                    path: "SKILL.md".to_string(),
+                    content: b"absolute\n".to_vec(),
+                    executable: false,
+                }],
+            )
+            .expect("absolute write");
+        let landed = fs::read_dir(&install)
+            .expect("dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .any(|path| {
+                fs::read(path.join("SKILL.md")).ok().as_deref() == Some(b"absolute\n".as_slice())
+            });
+        assert!(
+            landed,
+            "absolute key was not installed inside the install dir"
+        );
+        assert!(root.join("abs-victim").is_file());
+        assert_eq!(fs::read(root.join("abs-victim")).expect("abs"), b"abs");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn version_one_lock_fails_before_entry_fields_are_parsed() {
+        let err = read_json(
+            r#"{"version":1,"skills":{"My Skill":{"source":"owner/repo","sourceType":"github"}}}"#,
+        )
+        .expect_err("version 1");
+        let message = err.to_string();
+        assert!(matches!(err, Error::UnsupportedLock(_)));
+        assert!(message.contains("unsupported lock file"), "{message}");
+        assert!(message.contains("version 1"), "{message}");
+        assert!(!message.contains("commit"), "{message}");
+        assert!(!message.contains("missing field"), "{message}");
     }
 }
