@@ -15,7 +15,8 @@ pub struct Lockfile {
 
 #[derive(Deserialize)]
 struct Document {
-    version: u64,
+    #[serde(rename = "version")]
+    _version: u64,
     skills: BTreeMap<String, Entry>,
 }
 
@@ -54,23 +55,25 @@ impl Lockfile {
         }
         let document: Document =
             serde_json::from_value(value).map_err(|err| Error::UnsupportedLock(err.to_string()))?;
-        let reject = |message: String| Error::UnsupportedLock(message);
-        if document.version != 2 {
-            return Err(reject(format!("version {}", document.version)));
-        }
         let mut skills = Vec::with_capacity(document.skills.len());
         for (name, entry) in document.skills {
             if entry.skill_name.is_some() {
-                return Err(reject(format!("skill {name} is renamed")));
+                return Err(Error::UnsupportedLock(format!("skill {name} is renamed")));
             }
             if entry.commit.is_empty() {
-                return Err(reject(format!("skill {name} is missing a commit")));
+                return Err(Error::UnsupportedLock(format!(
+                    "skill {name} is missing a commit"
+                )));
             }
             if entry.skill_path.is_empty() {
-                return Err(reject(format!("skill {name} is missing a skill path")));
+                return Err(Error::UnsupportedLock(format!(
+                    "skill {name} is missing a skill path"
+                )));
             }
             if entry.computed_hash.is_empty() {
-                return Err(reject(format!("skill {name} is missing a computed hash")));
+                return Err(Error::UnsupportedLock(format!(
+                    "skill {name} is missing a computed hash"
+                )));
             }
             skills.push(Skill {
                 name,
