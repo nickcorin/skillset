@@ -1,17 +1,37 @@
 mod cli;
+mod content_hash;
+mod error;
+mod installer;
+mod lockfile;
+mod skill;
 
 use std::io::{self, Write};
+use std::path::Path;
 use std::process::ExitCode;
 
 use clap::Parser;
 
-use crate::cli::Cli;
+use crate::cli::{Cli, Command};
+use crate::installer::Installer;
+use crate::lockfile::Lockfile;
 
 const EXIT_FAILURE: u8 = 1;
 
 fn main() -> ExitCode {
     match Cli::try_parse() {
-        Ok(_) => ExitCode::SUCCESS,
+        Ok(Cli {
+            command: Command::Install { dir },
+        }) => {
+            match Lockfile::read(Path::new("skills-lock.json"))
+                .and_then(|lockfile| Installer { dir }.install(&lockfile))
+            {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    let _ = writeln!(io::stderr(), "{err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Err(err) => ExitCode::from(write_clap_error(&err, &mut io::stdout(), &mut io::stderr())),
     }
 }
@@ -107,7 +127,7 @@ mod tests {
             b"\
 error: unexpected argument '--bogus' found
 
-Usage: skillset
+Usage: skillset <COMMAND>
 
 For more information, try '--help'.
 "
