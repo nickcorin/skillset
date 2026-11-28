@@ -1,4 +1,4 @@
-//! The files of one skill. One is built only when those files hash to the lock's `computedHash`.
+//! A skill named in the lock, and the files that matched its `computedHash`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -8,6 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use flate2::read::GzDecoder;
+use serde::Deserialize;
 
 use crate::content_hash::ContentHash;
 use crate::error::Error;
@@ -20,75 +21,74 @@ struct File {
     executable: bool,
 }
 
-/// The files installed for one skill.
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum SourceKind {
+    Github,
+}
+
+/// Where the lock says the skill is, and the files once they have been fetched.
+#[derive(Deserialize)]
 pub struct Skill {
+    #[serde(skip)]
+    pub(crate) name: String,
+    pub(crate) source: String,
+    pub(crate) commit: String,
+    #[serde(rename = "skillPath")]
+    pub(crate) skill_path: String,
+    #[serde(rename = "computedHash")]
+    pub(crate) hash: ContentHash,
+    #[serde(rename = "sourceType")]
+    _source_type: SourceKind,
+    #[serde(skip)]
     files: BTreeMap<String, File>,
 }
 
 impl Skill {
-    /// Files of the skill whose `SKILL.md` is at `skill_path` in a codeload tarball.
+    /// Keeps this skill's files from a codeload tarball when they hash to `computedHash`.
     ///
-    /// A symlink becomes the file it names when that file stays inside the skill folder.
-    /// A link that is broken, loops, leaves the folder, or is absolute is left out.
-    /// `metadata.json`, `.git`, `__pycache__`, and `__pypackages__` are left out.
-    pub(crate) fn from_tarball(
-        bytes: &[u8],
-        skill_path: &str,
-        hash: &ContentHash,
-    ) -> Result<Self, Error> {
+    /// A relative symlink becomes the file it names, up to 40 hops, when that file stays
+    /// inside the skill folder. Anything else is left out, as are `metadata.json`, `.git`,
+    /// `__pycache__`, and `__pypackages__`.
+    pub(crate) fn take(&mut self, archive: &[u8]) -> Result<(), Error> {
+        fn broken(source: io::Error) -> Error {
+            Error::new(format!("cannot read archive: {source}"))
+        }
         fn plain(path: &str) -> bool {
             !path.is_empty()
                 && path.split('/').all(|part| {
                     !part.is_empty() && part != "." && part != ".." && !part.contains(['\\', ':'])
                 })
         }
-        fn relative<'a>(root: &str, path: &'a str) -> Option<&'a str> {
-            if root.is_empty() {
-                return Some(path);
-            }
-            path.strip_prefix(root)?.strip_prefix('/')
-        }
-        fn skip(rel: &str) -> bool {
-            rel.split('/').any(|part| {
+        fn kept<'a>(root: &str, path: &'a str) -> Option<&'a str> {
+            let rel = if root.is_empty() {
+                path
+            } else {
+                path.strip_prefix(root)?.strip_prefix('/')?
+            };
+            let excluded = rel.split('/').any(|part| {
                 matches!(
                     part,
                     "" | "." | ".." | "metadata.json" | ".git" | "__pycache__" | "__pypackages__"
                 )
-            })
-        }
-        fn inside(root: &str, path: &str) -> bool {
-            if root.is_empty() {
-                return !path.is_empty();
-            }
-            path.strip_prefix(root)
-                .is_some_and(|rest| rest.starts_with('/'))
-        }
-        fn join(parent: &str, target: &str) -> Option<String> {
-            let mut parts: Vec<&str> = if parent.is_empty() {
-                Vec::new()
-            } else {
-                parent.split('/').collect()
-            };
-            for part in target.split('/') {
-                match part {
-                    "" | "." => {}
-                    ".." => {
-                        parts.pop()?;
-                    }
-                    other => parts.push(other),
-                }
-            }
-            Some(parts.join("/"))
+            });
+            (!excluded).then_some(rel)
         }
         fn lookup<'a>(
             files: &'a BTreeMap<String, File>,
             links: &'a BTreeMap<String, String>,
             root: &str,
-            path: &str,
+            start: &str,
         ) -> Option<&'a File> {
-            let mut path = path.to_owned();
+            let mut path = start.to_owned();
             for _ in 0..HOPS {
-                if !inside(root, &path) {
+                let under = if root.is_empty() {
+                    !path.is_empty()
+                } else {
+                    path.strip_prefix(root)
+                        .is_some_and(|rest| rest.starts_with('/'))
+                };
+                if !under {
                     return None;
                 }
                 if let Some(file) = files.get(&path) {
@@ -99,20 +99,30 @@ impl Skill {
                     return None;
                 }
                 let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
-                path = join(parent, target)?;
+                let mut parts: Vec<&str> = if parent.is_empty() {
+                    Vec::new()
+                } else {
+                    parent.split('/').collect()
+                };
+                for part in target.split('/') {
+                    match part {
+                        "" | "." => {}
+                        ".." => {
+                            parts.pop()?;
+                        }
+                        other => parts.push(other),
+                    }
+                }
+                path = parts.join("/");
             }
             None
         }
 
-        let mut archive = tar::Archive::new(GzDecoder::new(bytes));
+        let mut tar = tar::Archive::new(GzDecoder::new(archive));
         let mut archived = BTreeMap::new();
         let mut links = BTreeMap::new();
-        for entry in archive
-            .entries()
-            .map_err(|source| Error::new(format!("cannot read archive: {source}")))?
-        {
-            let mut entry =
-                entry.map_err(|source| Error::new(format!("cannot read archive: {source}")))?;
+        for entry in tar.entries().map_err(broken)? {
+            let mut entry = entry.map_err(broken)?;
             let kind = entry.header().entry_type();
             if kind.is_pax_global_extensions() {
                 continue;
@@ -156,14 +166,9 @@ impl Skill {
                 })?;
                 links.insert(inner.to_owned(), target.to_owned());
             } else if kind.is_file() || kind.is_contiguous() {
-                let mode = entry
-                    .header()
-                    .mode()
-                    .map_err(|source| Error::new(format!("cannot read archive: {source}")))?;
+                let mode = entry.header().mode().map_err(broken)?;
                 let mut body = Vec::new();
-                entry
-                    .read_to_end(&mut body)
-                    .map_err(|source| Error::new(format!("cannot read archive: {source}")))?;
+                entry.read_to_end(&mut body).map_err(broken)?;
                 archived.insert(
                     inner.to_owned(),
                     File {
@@ -178,47 +183,43 @@ impl Skill {
             }
         }
 
-        let root = skill_path.rsplit_once('/').map_or("", |(dir, _)| dir);
+        let root = self.skill_path.rsplit_once('/').map_or("", |(dir, _)| dir);
         let mut files = BTreeMap::new();
         for (path, file) in &archived {
-            let Some(rel) = relative(root, path) else {
-                continue;
-            };
-            if skip(rel) {
-                continue;
+            if let Some(rel) = kept(root, path) {
+                files.insert(rel.to_owned(), file.clone());
             }
-            files.insert(rel.to_owned(), file.clone());
         }
         for path in links.keys() {
-            let Some(rel) = relative(root, path) else {
+            let Some(rel) = kept(root, path) else {
                 continue;
             };
-            if skip(rel) {
-                continue;
-            }
             let Some(file) = lookup(&archived, &links, root, path) else {
                 continue;
             };
             files.insert(rel.to_owned(), file.clone());
         }
 
-        let skill_file = skill_path
+        let skill_file = self
+            .skill_path
             .rsplit_once('/')
-            .map_or(skill_path, |(_, name)| name);
+            .map_or(self.skill_path.as_str(), |(_, name)| name);
         if !files.contains_key(skill_file) {
-            return Err(Error::new(format!("not found at {skill_path}")));
+            return Err(Error::new(format!("not found at {}", self.skill_path)));
         }
         let actual = ContentHash::of_files(
             files
                 .iter()
                 .map(|(path, file)| (path.as_str(), file.bytes.as_slice())),
         );
-        if &actual != hash {
+        if actual != self.hash {
             return Err(Error::new(format!(
-                "does not match skills-lock.json: computedHash is {hash} but the fetched files hash to {actual}"
+                "does not match skills-lock.json: computedHash is {} but the fetched files hash to {actual}",
+                self.hash
             )));
         }
-        Ok(Self { files })
+        self.files = files;
+        Ok(())
     }
 
     pub(crate) fn matches(&self, dir: &Path) -> Result<bool, Error> {

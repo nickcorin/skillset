@@ -4,6 +4,8 @@
 use std::borrow::Cow;
 use std::fmt;
 
+use serde::Deserialize;
+use serde::de::{self, Deserializer};
 use sha2::{Digest, Sha256};
 
 /// A lowercase hex SHA-256 digest over a skill's files.
@@ -69,6 +71,17 @@ impl ContentHash {
 impl fmt::Display for ContentHash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ContentHash {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let hex = String::deserialize(deserializer)?;
+        Self::parse(&hex).ok_or_else(|| {
+            de::Error::custom(format!(
+                "invalid computedHash {hex:?} (expected a lowercase hex SHA-256 digest)"
+            ))
+        })
     }
 }
 
