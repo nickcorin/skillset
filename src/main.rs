@@ -5,7 +5,6 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use skillset::install::InstallFolder;
-use skillset::source::GitHub;
 
 use crate::cli::{Cli, Command};
 
@@ -19,9 +18,7 @@ fn main() -> ExitCode {
         }
     };
     let result = match cli.command {
-        Command::Install(args) => {
-            InstallFolder::install(&args.lock, args.dir.as_deref(), &GitHub::codeload())
-        }
+        Command::Install(args) => InstallFolder::install(&args.lock, args.dir.as_deref()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

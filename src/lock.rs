@@ -1,85 +1,62 @@
-//! A version 2 `skills-lock.json`: GitHub entries, plus an optional `skillset.installDir`
-//! that `npx skills` does not read.
+//! A version 2 `skills-lock.json`: the skills to restore, and an optional install folder.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::error::Error;
-use std::fmt;
+use std::collections::BTreeMap;
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
 use crate::content_hash::ContentHash;
-use crate::skill::{SkillPath, SkillPathError};
-use crate::source::{CommitSha, CommitShaError, GitHubRepo, GitHubRepoError};
+use crate::error::Error;
 
-/// A parsed lock file.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Lockfile {
-    /// `skillset.installDir`, relative to the lock file's folder.
+/// The lock file install restores from.
+pub struct Lock {
     install_dir: Option<PathBuf>,
-    /// Entries in skill-name order.
-    entries: Vec<LockEntry>,
+    entries: Vec<Entry>,
 }
 
-/// One GitHub skill at a pinned commit.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LockEntry {
-    name: String,
-    folder: FolderName,
-    repo: GitHubRepo,
-    commit: CommitSha,
-    skill_path: SkillPath,
-    hash: ContentHash,
+/// One skill recorded in the lock: where it lives on GitHub, and the hash it must match.
+pub(crate) struct Entry {
+    pub(crate) name: String,
+    pub(crate) source: String,
+    pub(crate) commit: String,
+    pub(crate) skill_path: String,
+    pub(crate) hash: ContentHash,
 }
 
-/// Install folder name derived by `npx skills` `sanitizeName`.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct FolderName(String);
-
-impl FolderName {
-    fn from_skill_name(name: &str) -> Self {
-        let mut sanitized = String::with_capacity(name.len());
-        let mut in_replaced_run = false;
-        for ch in name.to_lowercase().chars() {
-            if ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '.' || ch == '_' {
-                sanitized.push(ch);
-                in_replaced_run = false;
-            } else if !in_replaced_run {
-                sanitized.push('-');
-                in_replaced_run = true;
-            }
-        }
-        let trimmed = sanitized.trim_matches(['.', '-']);
-        let truncated = &trimmed[..trimmed.len().min(255)];
-        Self(if truncated.is_empty() {
-            "unnamed-skill".to_owned()
-        } else {
-            truncated.to_owned()
-        })
-    }
-
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for FolderName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl Lockfile {
-    pub fn read(path: &Path) -> Result<Self, LockError> {
-        let json = fs::read_to_string(path).map_err(|source| LockError::Read {
-            path: path.to_owned(),
-            source,
+impl Lock {
+    pub fn read(path: &Path) -> Result<Self, Error> {
+        let json = fs::read_to_string(path).map_err(|source| Error::io("read", path, source))?;
+        let raw: RawLock = serde_json::from_str(&json).map_err(|source| {
+            Error::new(format!(
+                "{}: not a valid skills lock file: {source}",
+                path.display()
+            ))
         })?;
-        Self::from_json(&json).map_err(|source| LockError::Parse {
-            path: path.to_owned(),
-            source: Box::new(source),
+        if raw.version != 2 {
+            return Err(Error::new(format!(
+                "{}: unsupported lock version {} (expected 2)",
+                path.display(),
+                raw.version
+            )));
+        }
+        let install_dir = match raw.skillset {
+            Some(settings) if settings.install_dir.is_empty() => {
+                return Err(Error::new(format!(
+                    "{}: \"skillset.installDir\" is empty",
+                    path.display()
+                )));
+            }
+            Some(settings) => Some(PathBuf::from(settings.install_dir)),
+            None => None,
+        };
+        let mut entries = Vec::with_capacity(raw.skills.len());
+        for (name, entry) in raw.skills {
+            entries.push(Entry::parse(path, name, entry)?);
+        }
+        Ok(Self {
+            install_dir,
+            entries,
         })
     }
 
@@ -87,95 +64,87 @@ impl Lockfile {
         self.install_dir.as_deref()
     }
 
-    pub(crate) fn entries(&self) -> &[LockEntry] {
+    pub(crate) fn entries(&self) -> &[Entry] {
         &self.entries
-    }
-
-    fn from_json(json: &str) -> Result<Self, LockParseError> {
-        let raw: RawLock =
-            serde_json::from_str(json).map_err(|err| LockParseError::Json(Box::new(err)))?;
-        if raw.version != 2 {
-            return Err(LockParseError::Version { found: raw.version });
-        }
-        let install_dir = match raw.skillset {
-            Some(settings) if settings.install_dir.is_empty() => {
-                return Err(LockParseError::EmptyInstallDir);
-            }
-            Some(settings) => Some(PathBuf::from(settings.install_dir)),
-            None => None,
-        };
-
-        let mut entries = Vec::with_capacity(raw.skills.len());
-        let mut folders = BTreeSet::new();
-        for (name, entry) in raw.skills {
-            let entry = LockEntry::from_raw(name, entry)?;
-            if !folders.insert(entry.folder.clone()) {
-                return Err(LockParseError::SharedFolder {
-                    folder: entry.folder,
-                });
-            }
-            entries.push(entry);
-        }
-        Ok(Self {
-            install_dir,
-            entries,
-        })
     }
 }
 
-impl LockEntry {
-    pub(crate) fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub(crate) fn folder(&self) -> &FolderName {
-        &self.folder
-    }
-
-    pub(crate) fn repo(&self) -> &GitHubRepo {
-        &self.repo
-    }
-
-    pub(crate) fn commit(&self) -> &CommitSha {
-        &self.commit
-    }
-
-    pub(crate) fn skill_path(&self) -> &SkillPath {
-        &self.skill_path
-    }
-
-    pub(crate) fn hash(&self) -> &ContentHash {
-        &self.hash
-    }
-
-    fn from_raw(name: String, raw: RawEntry) -> Result<Self, LockParseError> {
-        if let Some(skill_name) = raw.skill_name {
-            return Err(LockParseError::entry(
-                name,
-                EntryError::Renamed { skill_name },
-            ));
+impl Entry {
+    fn parse(lock_path: &Path, name: String, raw: RawEntry) -> Result<Self, Error> {
+        fn github_source(source: &str) -> Option<String> {
+            let trimmed = source.strip_suffix(".git").unwrap_or(source);
+            let (owner, name) = trimmed.split_once('/')?;
+            let owner_ok = !owner.is_empty()
+                && owner
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
+            let name_ok = !name.is_empty()
+                && name != "."
+                && name != ".."
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+            (owner_ok && name_ok).then(|| format!("{owner}/{name}"))
         }
-        let repo = GitHubRepo::parse(&raw.source).map_err(|source| {
-            LockParseError::entry(name.clone(), EntryError::Repository(source))
-        })?;
-        let commit = CommitSha::parse(&raw.commit)
-            .map_err(|source| LockParseError::entry(name.clone(), EntryError::Commit(source)))?;
-        let skill_path = SkillPath::parse(&raw.skill_path)
-            .map_err(|source| LockParseError::entry(name.clone(), EntryError::SkillPath(source)))?;
+
+        if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
+            return Err(Error::new(format!(
+                "{}: skill {name:?} cannot be installed as a folder",
+                lock_path.display()
+            )));
+        }
+        if raw.source_type != "github" {
+            return Err(Error::new(format!(
+                "{}: skill {name:?} has sourceType {:?} (expected \"github\")",
+                lock_path.display(),
+                raw.source_type
+            )));
+        }
+        let Some(source) = github_source(&raw.source) else {
+            return Err(Error::new(format!(
+                "{}: skill {name:?} has invalid \"source\" {:?} (expected owner/repo)",
+                lock_path.display(),
+                raw.source
+            )));
+        };
+        if raw.commit.len() != 40 || !raw.commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(Error::new(format!(
+                "{}: skill {name:?} has invalid \"commit\" {:?} \
+                 (expected a full 40-character hex commit SHA)",
+                lock_path.display(),
+                raw.commit
+            )));
+        }
+        let names_skill = raw
+            .skill_path
+            .rsplit('/')
+            .next()
+            .is_some_and(|part| part.eq_ignore_ascii_case("SKILL.md"));
+        let plain_path = !raw.skill_path.is_empty()
+            && raw.skill_path.split('/').all(|part| {
+                !part.is_empty() && part != "." && part != ".." && !part.contains(['\\', ':'])
+            });
+        if !names_skill || !plain_path {
+            return Err(Error::new(format!(
+                "{}: skill {name:?} has invalid \"skillPath\" {:?} \
+                 (expected a relative path to SKILL.md)",
+                lock_path.display(),
+                raw.skill_path
+            )));
+        }
         let Some(hash) = ContentHash::parse(&raw.computed_hash) else {
-            return Err(LockParseError::entry(
-                name,
-                EntryError::Hash {
-                    value: raw.computed_hash,
-                },
-            ));
+            return Err(Error::new(format!(
+                "{}: skill {name:?} has invalid \"computedHash\" {:?} \
+                 (expected a lowercase hex SHA-256 digest)",
+                lock_path.display(),
+                raw.computed_hash
+            )));
         };
         Ok(Self {
-            folder: FolderName::from_skill_name(&name),
             name,
-            repo,
-            commit,
-            skill_path,
+            source,
+            commit: raw.commit,
+            skill_path: raw.skill_path,
             hash,
         })
     }
@@ -189,7 +158,7 @@ struct RawLock {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct RawSkillset {
     install_dir: String,
 }
@@ -198,130 +167,8 @@ struct RawSkillset {
 #[serde(rename_all = "camelCase")]
 struct RawEntry {
     source: String,
-    /// Present so serde rejects a `sourceType` other than `github`.
-    #[serde(rename = "sourceType")]
-    _source_type: SourceKind,
+    source_type: String,
     commit: String,
     skill_path: String,
     computed_hash: String,
-    #[serde(default)]
-    skill_name: Option<String>,
-}
-
-#[derive(Deserialize, Clone, Copy)]
-#[serde(rename_all = "lowercase")]
-enum SourceKind {
-    Github,
-}
-
-/// Why a lock file could not be read.
-#[derive(Debug)]
-pub enum LockError {
-    Read {
-        path: PathBuf,
-        source: io::Error,
-    },
-    Parse {
-        path: PathBuf,
-        source: Box<LockParseError>,
-    },
-}
-
-#[derive(Debug)]
-pub enum LockParseError {
-    Json(Box<serde_json::Error>),
-    Version { found: u64 },
-    EmptyInstallDir,
-    SharedFolder { folder: FolderName },
-    Entry { name: String, source: EntryError },
-}
-
-impl LockParseError {
-    fn entry(name: String, source: EntryError) -> Self {
-        Self::Entry { name, source }
-    }
-}
-
-#[derive(Debug)]
-pub enum EntryError {
-    Renamed { skill_name: String },
-    Repository(GitHubRepoError),
-    Commit(CommitShaError),
-    SkillPath(SkillPathError),
-    Hash { value: String },
-}
-
-impl fmt::Display for LockError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Read { path, source } => write!(f, "cannot read {}: {source}", path.display()),
-            Self::Parse { path, source } => write!(f, "{}: {source}", path.display()),
-        }
-    }
-}
-
-impl Error for LockError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Read { source, .. } => Some(source),
-            Self::Parse { source, .. } => Some(source.as_ref()),
-        }
-    }
-}
-
-impl fmt::Display for LockParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Json(source) => write!(f, "not a valid skills lock file: {source}"),
-            Self::Version { found } => {
-                write!(f, "unsupported lock version {found} (expected 2)")
-            }
-            Self::EmptyInstallDir => f.write_str("\"skillset.installDir\" is empty"),
-            Self::SharedFolder { folder } => write!(
-                f,
-                "more than one skill would install into folder \"{folder}\""
-            ),
-            Self::Entry { name, source } => write!(f, "skill \"{name}\" {source}"),
-        }
-    }
-}
-
-impl Error for LockParseError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Json(source) => Some(source.as_ref()),
-            Self::Entry { source, .. } => Some(source),
-            Self::Version { .. } | Self::EmptyInstallDir | Self::SharedFolder { .. } => None,
-        }
-    }
-}
-
-impl fmt::Display for EntryError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Renamed { skill_name } => write!(
-                f,
-                "is installed under a new name (skillName {skill_name:?}); \
-                 renamed skills cannot be installed because their SKILL.md differs from the source"
-            ),
-            Self::Repository(source) => source.fmt(f),
-            Self::Commit(source) => source.fmt(f),
-            Self::SkillPath(source) => source.fmt(f),
-            Self::Hash { value } => write!(
-                f,
-                "has invalid \"computedHash\" {value:?} (expected a lowercase hex SHA-256 digest)"
-            ),
-        }
-    }
-}
-
-impl Error for EntryError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Repository(source) => Some(source),
-            Self::Commit(source) => Some(source),
-            Self::SkillPath(source) => Some(source),
-            Self::Renamed { .. } | Self::Hash { .. } => None,
-        }
-    }
 }
